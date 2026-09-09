@@ -53,6 +53,26 @@ describe('isOriginAllowed', () => {
         assert.strictEqual(isOriginAllowed(groups, 'http://tenantx.example.com'), false);
         assert.strictEqual(isOriginAllowed(groups, 'https://tenantx.example.com:8443'), false);
     });
+
+    test('Origin: null is checked against the whitelist, not waved through', () => {
+        // A file:// page or sandboxed iframe sends the literal string "null".
+        // It must not be confused with "no Origin header at all", which is allowed.
+        assert.strictEqual(isOriginAllowed(groups, 'null'), false);
+        assert.strictEqual(isOriginAllowed(groups, undefined), true);
+    });
+
+    test('allowing Origin: null requires the quoted string, a JSON null matches nothing', () => {
+        const quoted = { dev: { allowed_origins: ['null'] } };
+        assert.strictEqual(isOriginAllowed(quoted, 'null'), true);
+
+        // The silent-failure case worth guarding: a bare JSON null still counts
+        // toward the whitelist size, so the open-by-default fallback stays off and
+        // the entry can never match anything.
+        const literal = { dev: { allowed_origins: [null] } };
+        assert.strictEqual(getAllowedCorsOrigins(literal).size, 1);
+        assert.strictEqual(isOriginAllowed(literal, 'null'), false);
+        assert.strictEqual(isOriginAllowed(literal, 'https://anything.example.com'), false);
+    });
 });
 
 describe('getAllowedCorsOrigins', () => {

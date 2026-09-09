@@ -586,8 +586,8 @@ class DeepJSONServer {
 
     /**
      * Whether a request carrying this Origin header may talk to the server at all.
-     * Shared by the Express CORS middleware, socket.io's own CORS block and its
-     * allowRequest handshake check, so all three can't drift apart.
+     * Shared by the Express CORS middleware and socket.io's CORS block, so the two
+     * can't drift apart.
      *
      * Two deliberate pass-throughs:
      * - empty whitelist: no group has opted in yet, so everything stays allowed,
@@ -595,6 +595,19 @@ class DeepJSONServer {
      * - no Origin header: not a browser (curl, server-to-server, native client).
      *   Such clients ignore CORS anyway, so refusing them here would buy nothing
      *   while breaking legitimate integrations. Real protection is the JWT check.
+     *
+     * Careful with "null" - it is NOT one of those pass-throughs. A browser sends
+     * the literal header `Origin: null` for a page opened straight off disk
+     * (file://), for sandboxed iframes and for some redirect chains, and it arrives
+     * here as the four-character string "null", not as a missing origin. It is
+     * therefore matched against the whitelist like any other origin, on purpose:
+     * "null" identifies no one, so any sandboxed iframe on any site could claim it.
+     *
+     * If a setup really has to allow it (local development against a file:// page),
+     * allowed_origins needs the QUOTED string "null". A bare JSON null literal
+     * silently matches nothing: it still counts toward the whitelist size, so the
+     * open-by-default fallback does not kick in either, and every browser request
+     * is refused with no hint as to why.
      */
     isOriginAllowed(origin) {
         const allowed = this.getAllowedCorsOrigins();
