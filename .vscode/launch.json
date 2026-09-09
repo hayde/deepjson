@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch DeepJSON Server",
+            "type": "node",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.js",
+            "args": ["/etc/deepjson/dj.config"], // Path to config file
+            "env": {
+                "NODE_ENV": "development",
+                "DJ_ACCESS_FILE": "/etc/deepjson/access.json",
+                "SSL_ENABLED": "false" // Set to "true" for HTTPS
+            },
+            "console": "integratedTerminal",
+            "skipFiles": [
+                "<node_internals>/**"
+            ],
+            "preLaunchTask": "npm: install" // Optional
+        },
+        {
+            "name": "Attach Debugger to Running Server",
+            "type": "node",
+            "request": "attach",
+            "port": 9229,
+            "restart": true,
+            "protocol": "inspector"
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Debug Server + Admin Client",
+            "configurations": ["Launch DeepJSON Server", "Attach Debugger to Running Server"]
+        }
+    ]
+}

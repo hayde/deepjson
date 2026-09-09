@@ -1,0 +1,1963 @@
+const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs'); // Regular fs for sync methods
+const fsp = require('fs').promises; // Promise-based fs
+const path = require('path');
+const { getScriptEngine } = require('./lib/scriptEngines');
+const moment = require('moment');
+const _ = require('lodash');
+const https = require('https');
+const http = require('http');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const fileUpload = require('express-fileupload');
+const sharp = require('sharp');
+const { Server } = require('socket.io');
+const contentDisposition = require('content-disposition');
+
+
+
+/**
+ * todo:
+ * 20250429 cs  move statement implementation (check in client)
+ * 20250429 cs permission check not really valid, please check specially for get with value (script)
+ */
+
+/**
+ * functionalities
+ * 
+ * protocolls
+ * - http
+ * - https
+ * 
+ * authetication:
+ * - jws
+ * - HMAC
+ * - access.json
+ * - device enabling
+ * 
+ * 
+ * 
+ */
+class DeepJSONServer {
+
+    constructor() {
+        this.config = this.loadConfig();
+        this.accessData = this.loadAccessData();
+        this.index = new Map();
+        this.modificationCounter = 0;
+
+        // express server
+        this.app = undefined;       // application 
+        this.server = undefined;    // listening server
+
+        // socket
+        this.io = undefined;        // webSocket
+        this.sessions = undefined;  // session map
+
+    }
+
+    loadConfig() {
+        const configPath = process.argv[2] || '/etc/deepjson/dj.config';
+        // Use sync method during initialization
+        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    }
+
+    loadAccessData() {
+        return JSON.parse(fs.readFileSync(this.config.access_file));
+    }
+
+    async initialize() {
+        await this.createDirectories();
+        await this.loadIndex();
+        this.setupServer();
+    }
+
+    async createDirectories() {
+        const base = this.config.data_root;
+        await fsp.mkdir(path.join(base, 'data'), { recursive: true });
+        await fsp.mkdir(path.join(base, 'index'), { recursive: true });
+        await fsp.mkdir(path.join(base, 'index', 'archive'), { recursive: true });
+        await fsp.mkdir(path.join(base, 'logs'), { recursive: true });
+        await fsp.mkdir(path.join(base, 'scripts'), { recursive: true });
+    }
+
+    /**
+     * setup the express server
+     */
+    setupServer() {
+        this.app = express();
+
+        // Core middleware
+        this.app.use(express.json({ limit: this.config.payload_limit || '10mb' }));
+        this.app.use(fileUpload({
+            limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+            abortOnLimit: true
+        }));
+
+
+        // key requests could be text
+        this.app.use('/keys/:key', express.text({ type: 'text/*' }));
+
+        // exposedHeaders: X-Renewed-Token carries the sliding-session token
+        // (see authMiddleware()) - without this, browser-based clients can't
+        // read it, even though the header is present in the raw response.
+        this.app.use(cors({ exposedHeaders: ['X-Renewed-Token'] }));
+        this.app.use((req, res, next) => {
+            if (req.secure) {
+                res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+            }
+            next();
+        });
+
+
+        // Add login route 
+        this.app.post('/auth/login', this.handleLogin.bind(this));
+        // Add middleware
+        this.app.use(this.authMiddleware.bind(this)); // first usage of the route: check authentification
+
+        // here we add the header checking for the system
+        this.app.use((req, res, next) => {
+            res.locals = res.locals || {};
+            res.locals.overwriteMethod = this._hasaOverwriteMethod(req);
+            res.locals.fileUpload = this._isFileUpload(req);
+            res.locals.binaryRequest = this._isBinaryRequest(req);
+            res.locals.overwriteExisting = this._hasOverwriteExisting(req);
+            res.locals.image = this._hasImageModulation(req);
+
+            // if it is a file upload, the binary flag is not relevant. Creates an issue!
+            if (res.locals.fileUpload) res.locals.binaryRequest = false;
+            next();
+        });
+
+        // Core routes
+        this.app.route('/keys/:key')
+            .get(this.handleKeyRequest.bind(this))
+            .post(this.handleKeyRequest.bind(this))
+            .put(this.handleKeyRequest.bind(this))
+            .delete(this.handleKeyRequest.bind(this));
+
+        // move route
+        this.app.post('/cmd/move', this.handleMove.bind(this));
+        this.app.route('/cmd/keys/')
+            .get(this.handleListKeys.bind(this))
+            .post(this.handleListKeys.bind(this));
+
+        // Admin routes
+        this.setupAdminRoutes();
+
+        // Create servers
+        if (this.config.ssl?.enabled) {
+            const sslOptions = {
+                key: fs.readFileSync(this.config.ssl.key),
+                cert: fs.readFileSync(this.config.ssl.cert)
+            };
+            this.server = https.createServer(sslOptions, this.app);
+        } else {
+            this.server = http.createServer(this.app);
+        }
+
+
+        // attack web sockets to the server
+        this._setupSocketServer(this.server);
+
+
+        // Start listening
+        const port = this.config.ssl?.enabled
+            ? this.config.ssl.port
+            : this.config.port;
+
+        console.log( "Starting Listener" );
+        this.server.listen(port, () => {
+            console.log(`Listening on ${this.config.ssl?.enabled ? 'HTTPS' : 'HTTP'} port ${port}`);
+        });
+
+    }
+
+    /**
+     * SocketServer implementation
+     * @param expressServer 
+     */
+    _setupSocketServer(expressServer) {
+        this.io = new Server(expressServer, {
+            cors: {
+                origin: '*',
+                methods: ["GET", "POST"],
+                allowedHeaders: ["Authorization", "Content-Type"],
+                credentials: false
+            }
+        });
+        this.sessions = new Map();
+
+        this.io.on('connection', (socket) => {
+            const token = socket.handshake.query.token;
+            const action = socket.handshake.query.action;
+            let channelId = socket.handshake.query.channelId;
+            let user = null;
+
+            // Authentication remains the same
+            try {
+                const decoded = jwt.verify(token, this.config.jwt_secret);
+                user = this.accessData.users[decoded.id];
+                if (!user) throw new Error('User not found');
+            } catch (err) {
+                socket.emit('error', { code: 'AUTH_FAILED', message: 'Invalid authentication' });
+                socket.disconnect();
+                return;
+            }
+
+            // New session validation logic
+            if (action === 'connect' && channelId) {
+                const session = this.sessions.get(channelId);
+
+                if (session && this.config.preventDuplicateSessionConnections) {
+                    const isAlreadyInSession = session.clients.some(c => c.user.id === user.id) ||
+                        session.master.user.id === user.id;
+
+                    if (isAlreadyInSession && !this.config.allowMultipleSessionConnections) {
+                        socket.emit('error', {
+                            code: 'ALREADY_IN_SESSION',
+                            message: 'User already participating in this session'
+                        });
+                        socket.disconnect();
+                        return;
+                    }
+                }
+            }
+
+            // Rest of the original logic remains unchanged
+            if (action === 'create') {
+                channelId = this._createNewSession(socket, user);
+                socket.emit('session-created', { channelId });
+            } else if (action === 'connect') {
+                if (!this._validateSessionJoin(socket, channelId, user)) return;
+            } else {
+                socket.emit('error', { code: 'INVALID_ACTION', message: 'Missing or invalid action' });
+                socket.disconnect();
+                return;
+            }
+
+            const session = this.sessions.get(channelId);
+            this._setupSessionHandlers(socket, session, user);
+        });
+    }
+
+    _createNewSession(socket, user) {
+        const generateId = () => {
+            const chars = 'abcdefghijkmnpqrstuvwxyz0123456789';
+            let id = '';
+            for (let i = 0; i < 5; i++) {
+                const idx = crypto.randomInt(0, chars.length);
+                id += chars[idx];
+            }
+            return id;
+        };
+    
+        let channelId;
+        do {
+            channelId = generateId();
+        } while (this.sessions.has(channelId)); // retry if ID already exists
+    
+        const session = {
+            channelId,
+            master: { socket, user },
+            clients: [],
+            created: Date.now(),
+            lastActivity: Date.now(),
+            metadata: {}
+        };
+    
+        this.sessions.set(channelId, session);
+        return channelId;
+    }
+
+    _validateSessionJoin(socket, channelId, user) {
+        if (!channelId || !this.sessions.has(channelId)) {
+            socket.emit('error', {
+                code: 'INVALID_SESSION',
+                message: `Session ${channelId} does not exist`
+            });
+            socket.disconnect();
+            return false;
+        }
+
+        const session = this.sessions.get(channelId);
+        if (session.clients.length >= this.config.maxClientsPerSession) {
+            socket.emit('error', { code: 'SESSION_FULL', message: 'Session reached maximum capacity' });
+            socket.disconnect();
+            return false;
+        }
+        return true;
+    }
+
+    _setupSessionHandlers(socket, session, user) {
+        // Add client to session
+        const clientInfo = { socket, user, joined: Date.now() };
+        if (socket === session.master.socket) {
+            session.master.socket = socket; // Refresh socket reference
+        } else {
+            session.clients.push(clientInfo);
+        }
+
+        // Initialization
+        socket.emit('session-joined', {
+            channelId: session.channelId,
+            isMaster: socket === session.master.socket,
+            participants: this._getParticipantList(session)
+        });
+
+        // Broadcast new participant to others
+        this._broadcast(session, 'participant-joined', {
+            userId: user.id,
+            timestamp: Date.now()
+        }, socket);
+
+        // Message handling
+        socket.on('message', (payload) => {
+            session.lastActivity = Date.now();
+            if (typeof payload !== 'object' || payload === null) {
+                return socket.emit('error', { code: 'INVALID_PAYLOAD' });
+            }
+            this._broadcast(session, payload.type, payload.data, socket);
+        });
+
+        // Disconnection handling
+        socket.on('disconnect', () => {
+            if (socket === session.master.socket) {
+                this._handleMasterDisconnect(session);
+            } else {
+                this._handleClientDisconnect(session, socket);
+            }
+        });
+    }
+
+    _broadcast(session, type, data, excludeSocket = null) {
+        const payload = { type, data, timestamp: Date.now() };
+
+        // Send to master
+        if (session.master.socket !== excludeSocket) {
+            session.master.socket.emit('message', payload);
+        }
+
+        // Send to clients
+        session.clients.forEach(client => {
+            if (client.socket !== excludeSocket && client.socket.connected) {
+                client.socket.emit('message', payload);
+            }
+        });
+    }
+
+    _handleMasterDisconnect(session) {
+        // Notify all clients
+        this._broadcast(session, 'session-ended', {
+            reason: 'Master disconnected'
+        });
+
+        // Disconnect all clients
+        session.clients.forEach(client => {
+            client.socket.disconnect();
+        });
+
+        // Cleanup session
+        this.sessions.delete(session.channelId);
+    }
+
+    _handleClientDisconnect(session, socket) {
+        var leaving_user = session.clients.filter(c => c.socket === socket);
+        if (leaving_user.length === 0) {
+            // there is no user like that!
+        } else {
+            // get the first element
+            leaving_user = leaving_user[0];
+
+            // Remove client from session
+            session.clients = session.clients.filter(c => c.socket !== socket);
+
+            // Notify remaining participants
+            this._broadcast(session, 'participant-left', {
+                userId: leaving_user.user.id,
+                timestamp: Date.now()
+            });
+
+            // Cleanup if empty
+            if (session.clients.length === 0) {
+                setTimeout(() => {
+                    if (session.clients.length === 0) {
+                        this.sessions.delete(session.channelId);
+                    }
+                }, this.config.emptySessionTTL);
+            }
+        }
+    }
+
+    _getParticipantList(session) {
+        return {
+            master: session.master.user.id,
+            clients: session.clients.map(c => c.user.id)
+        };
+    }
+
+    /**
+     * end web-socket implementaation 
+     */
+
+    /**
+     * Loggin functionality
+     * 
+     * it is implemented as app.use for all requests
+     */
+    async logRequest(req, res, error = null) {
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            method: req.method,
+            o_method: res.locals.overwriteMethod,
+            path: req.path,
+            user: req.user?.id || 'anonymous',
+            key: req.params.key,
+            status: error ? 500 : res.statusCode,
+            error: error?.message
+        };
+
+        const logPath = path.join(
+            this.config.data_root,
+            'logs',
+            `${moment().format('YYYY-MM-DD')}.log`
+        );
+
+        await fsp.appendFile(logPath, JSON.stringify(logEntry) + '\n');
+    }
+    /**
+     * express implementation check the authentification
+     */
+    authMiddleware(req, res, next) {
+        // Skip auth for login route
+        if (req.path === '/auth/login') return next();
+
+        /**
+         * HMAC Authentication Implementation for io devices
+         */
+        if (this.accessData.hmac_auth_settings?.device_auth_enabled) {
+            const deviceAuth = req.headers['x-device-auth'];
+            if (deviceAuth) {
+                return this.handleDeviceAuth(req, res, next);
+            }
+        }
+        /* end HMAC implementation */
+
+        // we have 2 token delivery methods: token in query and token in header.
+        var token = null;
+        const authHeader = req.headers.authorization;
+        const authQuery = req.query.token;
+
+        // tokens check
+        /* if (authQuery && authHeader) {
+            return res.status(401).json({ error: 'double authentication token in query string and header!' });
+        } else */ 
+         if (authHeader && !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Header carries valid "authorisation:" line, but missing the "Bearer " introduction!' });
+        } else if (!authQuery && !authHeader) {
+            return res.status(401).json({ error: 'No token available! Not in URL Query, nor in Header.' });
+        }
+
+        if (authQuery) {
+            token = authQuery;
+        } else if (authHeader) {
+            // remove the 'Bearer ' part
+            token = authHeader.split(' ')[1];;
+        } else {
+            return res.status(401).json({ error: 'Missing token query string "&token={token}" or in header "authoriziation: Bearer {token}"' });
+        }
+
+        try {
+            const decoded = jwt.verify(token, this.config.jwt_secret);
+            req.user = this.accessData.users[decoded.id];
+
+            // Sliding session: a JWT's expiry is baked into its signature, so it
+            // can't be extended in place. Instead, every successful, authenticated
+            // request re-issues a brand-new token with a fresh 1h expiry, carried
+            // back in X-Renewed-Token (same payload shape as the login token, see
+            // handleLogin()). The client must read this header and use it as the
+            // bearer token for its next request; if it doesn't, the original token
+            // simply expires at its original 1h mark as before - this only extends
+            // the session for clients that actually pick up the renewed token.
+            if (req.user) {
+                const renewedToken = jwt.sign(
+                    { id: req.user.id, groups: req.user.groups },
+                    this.config.jwt_secret,
+                    { expiresIn: '1h' }
+                );
+                res.set('X-Renewed-Token', renewedToken);
+            }
+
+            next();
+        } catch (err) {
+            res.status(401).json({ error: 'Invalid authentication' });
+        }
+    }
+
+    getKeyPath(key) {
+        const hash = crypto.createHash('sha256').update(key).digest('hex');
+        const depth = this.config.index_depth;
+        let pathParts = [];
+
+        for (let i = 0; i < depth; i++) {
+            pathParts.push(hash.substr(i * 2, 2));
+        }
+
+        return {
+            hash,
+            dir: path.join(this.config.data_root, 'data', ...pathParts),
+            file: hash
+        };
+    }
+
+    checkPermissions(user, key, operation) {
+        const permIndex = { C: 0, R: 1, U: 2, D: 3, X: 4 };
+        const idx = permIndex[operation];
+        if (idx === undefined) return false;
+
+        const userGroups = this.accessData.users[user.id].groups;
+        let allowed = false;
+
+        userGroups.forEach(group => {
+            this.accessData.groups[group].rules.forEach(rule => {
+                if (new RegExp(rule.regex).test(key)) {
+                    var crudx = rule.crudx;
+                    if (!crudx && rule.crud) {
+                        // it is an old access.json format. in this case the excute was always allowed
+                        crudx = rule.crud + '1';
+                    }
+
+                    if (crudx) {
+                        allowed = crudx[idx] === '1';
+                    }
+                }
+            });
+        });
+
+        return allowed;
+    }
+
+    checkAdmin(user) {
+        if (!user || !user.id) return false;
+
+        // Get user's groups from access data
+        const userEntry = this.accessData.users[user.id];
+        if (!userEntry || !userEntry.groups) return false;
+
+        // Consider both 'admin' and 'superadmin' as admin roles
+        const adminGroups = new Set(['admin', 'superadmin']);
+
+        return userEntry.groups.some(group =>
+            adminGroups.has(group) ||
+            this.accessData.groups[group]?.rules?.some(rule =>
+                rule.crudx?.[4] === '1' // Check execute permission (5th character)
+            )
+        );
+    }
+
+    async executeScript(req, code, context) {
+        const engine = getScriptEngine(this.config.script_engine);
+        const limits = {
+            timeoutMs: parseInt(this.config.script_execution_time_limit) || 5000,
+            memoryLimitBytes: 50 * 1024 * 1024 // 50MB
+        };
+
+        try {
+            return await engine.run(code, context, limits);
+        } catch (err) {
+            if (err.code === 'TIMEOUT') {
+                throw new Error('Script exceeded maximum execution time');
+            } else {
+                throw new Error(`Script failed: "${err.message}"`);
+            }
+        }
+    }
+    // Add to handleKeyRequest body processing
+    async processScriptBody(req, script, body, data) {
+        if (script) {
+            return this.executeScript(req, script, {
+                origin: data,
+                custom: data ? data.custom : undefined,
+                body: body,
+                data: data ? data.value : undefined,
+                user: req.user.user,
+                http_method: req.method,
+                key: data ? data._key : undefined,
+                hash: data ? data._hash : undefined,
+                response: null
+            })
+        };
+        return null;
+    }
+
+    async handleKeyRequest(req, res) {
+        try {
+            let key = req.params.key;
+            let generatedKey = undefined;
+            const user = req.user;
+            var response = {}; // here we will store the response, which might be modified through the existence of the script handling.
+            response.options = {}; // http options like status ...
+            response.modifiable_method = null;
+
+            res.locals.original_method = req.method;
+            if (res.locals.overwriteMethod) {
+                req.method = res.locals.overwriteMethod;
+            }
+
+            if (["GET", "DELETE"].indexOf(req.method) > -1) {
+                req.modifiable_method = false;
+            } else {
+                req.modifiable_method = true;
+            }
+
+            if (key.includes("*")) {
+
+                // Handle wildcard key generation for POST requests
+                if (req.method !== 'POST') {
+                    return res.status(403).json({ error: 'Wildcard "*" only allowed for POST commandds!' });
+                } else if (res.locals.overwriteMethod) {
+                    return res.status(403).json({ error: 'Wildcard "*" only allowed for POST commandds! without "overwrite-Method" header' });
+                } else {
+                    generatedKey = await this.processWildcardKey(key);
+                    if (generatedKey) {
+                        key = generatedKey;
+                        req.params.key = generatedKey; // Update request context
+                    }
+                }
+            }
+
+            // 1. Check key existence first
+            const exists = this.index.has(key);
+            if (req.method !== 'POST' && !exists) {
+                return res.status(404).json({ error: 'Key not found' });
+            }
+
+            // 2. Enhanced permission checking
+            const operation = this.mapMethodToOperation(req.method);
+            if (!this.checkPermissions(user, key, operation)) {
+                return res.status(403).json({ error: 'Insufficient permissions' });
+            }
+
+            // 3. parse the body request
+            const parsed = this.parseScriptPayload(req.body);
+            if (parsed.error) {
+                throw new Error(parsed.error);
+            }
+
+            // 3. read the key data
+            let data;
+            if (exists) {
+                data = await this.readKeyData(req, key);
+            }
+            // 4. Handle JavaScript execution
+            if (parsed.script) {
+                // check, if excution is allowed
+                if (!this.checkPermissions(req.user, key, 'X')) { // Execute permission check
+                    return res.status(403).json({ error: 'Execution not allowed' });
+                }
+                response = await this.processScriptBody(req, parsed.script, parsed.body, data);
+                // add the options to the response
+                response.options = {};
+
+                if (req.modifiable_method) {
+                    if (!response.data) {
+                        // a modifiable call needs to set the "data" variable in the script!
+                        response.options.status = 400;
+                        response.options.error = { error: 'script is a modifiable call, but misses to set the "data" value inside the script!' };
+                        response.options.content = "json";
+                    } else {
+                        response.options.status = 200;
+                        response.options.content = "json";
+                        response.data = { ...data, value: response.data, custom: response.custom };
+                        // if the response is not set, then put the data into the response values
+                        if (!response.response) {
+                            response.response = response.data.value;
+                        }
+                    }
+                } else if (!req.modifiable_method) {
+                    // if the response.response is set, use that, otherwise use the original data
+                    if (response.response) {
+                        // do nothing :)
+                        response.options.status = 200;
+                        response.options.content = "json";
+                    } else {
+                        // there is no response, no data, so it makes no sense to run that script.
+                        response.options.status = 403;
+                        response.options.content = "json";
+                        response.options.error = { error: "if this call doesn't make a modification to the 'response', and is a not modifiable call ('POST', 'PUT', ...), then it will not make a sense to call it anyway. Request blocked." };
+                    }
+                }
+            } else {
+                // it is just script free information.
+                // if this is a file upload, then the response is never the data uploaded itself.
+                if (res.locals.fileUpload) {
+                    response.response = { ok: "upload successfull" };
+                    response.data = '{"data": "this is just a dummy, since the write function will handle the upload itselfe" }';
+                } else {
+                    if (req.modifiable_method) {
+                        // a modifiable request don't need a response.
+                        // so it will overwrite the old data with the body
+                        response.data = { ...data, value: parsed.body };
+                        response.response = { ok: "successfull" };
+                    } else {
+                        // not modifiable requests need a response
+                        response.data = data;
+                        if (data) {
+                            response.response = response.data.value;
+                        }
+                    }
+                }
+            }
+
+            // 5. Handle core operations
+            if (!response.options.error) switch (req.method) {
+                case 'GET':
+                    res.set({
+                        'X-DeepJSON-ModCount': this.modificationCounter,
+                        'X-DeepJSON-ReadCount': this.index.get(key)?.readCount || 0
+                    });
+                    response.options.status = 200;
+                    response.options.content = "json";
+                    break;
+                //return res.json(response.response);
+
+                case 'POST':
+                    if (exists && !res.locals.overwriteExisting) {
+                        response.options.status = 400;
+                        response.options.error = { error: 'Key already exists (alternatively try "x-override-existing")' };
+                    } else {
+                        const tmp_data = response.data;
+                        await this.writeKeyData(req, res, key, tmp_data);
+                        response.options.status = 201;
+                        if (generatedKey) {
+                            response.response = { ok: "success", key: generatedKey };
+                        }
+                    }
+                    response.options.content = "json";
+                    break;
+                //return res.status(201).json(response.response);
+                case 'PUT':
+                    await this.writeKeyData(req, res, key, response.data);
+                    response.options.status = 200;
+                    response.options.content = "json";
+                    break;
+                //return res.json(response.response);
+
+                case 'DELETE':
+                    await this.deleteKeyData(req, key);
+                    response.options.status = 204;
+                    break;
+                //return res.status(204).send();
+
+                default:
+                    response.options.status = 405;
+                    response.options.error = { error: `Method not allowed: ${req.method}` };
+                    response.options.content = "json";
+                    break;
+            }
+            if (!response.options.status) {
+                response.options.status = 500;
+                response.options.error = { error: 'internal error: status not set' };
+                response.options.content = "json";
+            }
+            if (!res.locals.binaryRequest) {
+                res.status(response.options.status);
+
+                const output = response.options.error ? response.options.error : response.response;
+
+                if (response.options.content === "json") {
+                    res.json(output);
+                } else {
+                    res.send(output);
+                }
+                return res;
+            } else {
+                res.status(response.options.status);
+                return await this.handleFileResponse(response.data, res, req);
+            }
+        } catch (err) {
+            await this.logRequest(req, res, err);
+            const status = err.code === 'ENOENT' ? 404 : 500;
+            return res.status(status).json({
+                error: err.message,
+                code: err.code
+            });
+        }
+    }
+
+    // Helper method to map HTTP methods to CRUDX operations
+    mapMethodToOperation(method) {
+        const map = {
+            GET: 'R',
+            POST: 'C',
+            PUT: 'U',
+            PATCH: 'U',
+            DELETE: 'D',
+            HEAD: 'R',
+            OPTIONS: 'R'
+        };
+        return map[method] || 'R';
+    }
+
+    parseScriptPayload(body) {
+
+        const result = {
+            script: null,
+            body: null,
+            error: null
+        };
+
+        if (!body) {
+            // no body existing
+        } else {
+            try {
+                // throw errors, if it is the old format
+
+                if (body.indexOf('javascript:get') === 0) {
+                    // old get
+                    throw new Error('Old "javsacript:get" start tag. it has to be plain "javascript:"');
+                } else if (body.indexOf('javascript:set') === 0) {
+                    // old get
+                    throw new Error('Old "javsacript:set" start tag. it has to be plain "javascript:"');
+                }
+
+                // Check for javascript: operation at start
+                var scriptStart = body.indexOf('javascript:');
+                if (scriptStart === 0) {
+                    const scriptEnd = body.lastIndexOf('javascript!');
+                    if (scriptEnd === -1) {
+                        throw new Error('Missing closing "javascript!" tag');
+                    }
+
+                    result.script = body.substring(scriptStart + 'javascript:'.length, scriptEnd).trim();
+                    result.body = body.substring(scriptEnd + 'javascript!'.length).trim();
+                    if (result.body.length === 0) {
+                        result.body = null;
+                    } else {
+                        try {
+                            result.body = JSON.parse(result.body);
+                        } catch (err) {
+                            throw new Error(`Invalid JSON data: ${err.message}`);
+                        }
+                    }
+                } else {
+                    // no opening tag
+                    result.body = JSON.parse(body);
+                }
+
+            } catch (error) {
+                return { ...result, error: error.message };
+            }
+        }
+        return result;
+    }
+
+    setupAdminRoutes() {
+        const router = express.Router();
+
+        // Admin-only middleware
+        router.use((req, res, next) => {
+            if (!this.checkAdmin(req.user)) {
+                return res.status(403).json({ error: 'Admin access required' });
+            }
+            next();
+        });
+
+        // Admin endpoints
+        router.get('/keys', this.handleAdminKeys.bind(this));
+        router.get('/health', this.handleAdminHealth.bind(this));
+        router.get('/modifications/:since', this.handleAdminModCount.bind(this));
+
+        // Add new endpoints
+        router.post('/rebuild-index', async (req, res) => {
+            await this.rebuildIndex();
+            res.json({ status: 'success' });
+        });
+
+        router.get('/logs', async (req, res) => {
+            const logs = await this.getLogEntries();
+            res.json(logs);
+        });
+
+        // Mount under /admin prefix
+        this.app.use('/admin', router);
+    }
+    async getLogEntries(days = 7) {
+        const logFiles = [];
+        const now = moment();
+
+        for (let i = 0; i < days; i++) {
+            const date = now.clone().subtract(i, 'days');
+            const logPath = path.join(
+                this.config.data_root,
+                'logs',
+                `${date.format('YYYY-MM-DD')}.log`
+            );
+
+            if (await fsp.access(logPath).then(() => true).catch(() => false)) {
+                logFiles.push(logPath);
+            }
+        }
+
+        return Promise.all(logFiles.map(async file => {
+            const content = await fsp.readFile(file, 'utf8');
+            return content.split('\n').filter(l => l).map(JSON.parse);
+        }));
+    }
+
+    /**
+     * Path of the live index log that loadIndex()/updateIndex() append to,
+     * and that performIndexRotation() rewrites with the compacted state.
+     * Distinct from the dated archive snapshots written by saveIndexSnapshot().
+     */
+    getCurrentIndexPath() {
+        return path.join(this.config.data_root, 'index', 'dj.index');
+    }
+
+    /**
+     * Path of a dated archive snapshot (index/archive/dj.index.YYYYMMDD), kept
+     * separate from the live index log so index/ itself doesn't accumulate one
+     * file per rotation forever. See cleanupIndexArchive() for retention.
+     */
+    getIndexArchivePath(dateStr = moment().format('YYYYMMDD')) {
+        return path.join(this.config.data_root, 'index', 'archive', `dj.index.${dateStr}`);
+    }
+
+    async loadIndex() {
+        const indexPath = this.getCurrentIndexPath();
+
+        try {
+            // Check if index directory exists
+            await fsp.access(path.dirname(indexPath), fs.constants.F_OK);
+        } catch (dirError) {
+            // Create index directory if missing
+            await fsp.mkdir(path.dirname(indexPath), { recursive: true });
+        }
+
+        try {
+            const data = await fsp.readFile(indexPath, 'utf8');
+            let maxModCount = 0;
+
+            data.split('\n').forEach(entry => {
+                if (entry.trim()) {
+                    const [key, hash, created, modified, modCount, operation] = entry.split('|');
+
+                    // Handle DELETE operations
+                    if (operation === 'DELETE') {
+                        this.index.delete(key);
+                        maxModCount++;
+                    } else {
+                        const count = parseInt(modCount) || 0;
+                        this.index.set(key, {
+                            hash,
+                            created,
+                            modified: modified || created,
+                            modCount: count
+                        });
+                        maxModCount = Math.max(maxModCount, count);
+                    }
+                }
+            });
+
+            this.modificationCounter = maxModCount;
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                console.log('No existing index found. Starting fresh.');
+                this.index = new Map();
+
+                // Create initial empty index file
+                await this.saveIndexSnapshot();
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    // Add to existing updateIndex method
+    async updateIndex(req, key, operation, existingEntry = null) {
+        const now = new Date().toISOString();
+        var entry = this.index.get(key);
+
+        if (operation === 'DELETE') {
+            //logEntry = `${key}|${existingEntry?.hash || ''}|${existingEntry?.created || ''}|${now}|${existingEntry?.modCount || 0}|DELETE|${req.user?.id || 'system'}\n`;
+            this.index.delete(key);
+        } else {
+
+            if (!entry) {
+                entry = {
+                    hash: this.getKeyPath(key).hash,
+                    created: now,
+                    modified: now,
+                    modCount: 0
+                };
+            }
+
+            entry.modified = now;
+            entry.modCount = ++this.modificationCounter;
+
+            this.index.set(key, entry);
+
+        }
+        // Append to daily index log
+        const logEntry = `${key}|${entry.hash}|${entry.created}|${entry.modified}|${entry.modCount}|${operation}|${req.user?.id || 'system'}\n`;
+        await fsp.appendFile(
+            this.getCurrentIndexPath(),
+            logEntry
+        );
+    }
+
+    async rebuildIndex() {
+        this.index = new Map();
+        const dataDir = path.join(this.config.data_root, 'data');
+        let maxModCount = 0;
+
+        const traverse = async (dir) => {
+            const entries = await fsp.readdir(dir, { withFileTypes: true });
+
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    await traverse(fullPath);
+                } else {
+                    const result = await this.readKeyFromFile(fullPath);
+                    if (result) {
+                        this.index.set(result.key, result.entry);
+                        maxModCount = Math.max(maxModCount, result.entry.modCount);
+                    }
+                }
+            }
+        };
+
+        await traverse(dataDir);
+        // Keep the modification counter ahead of every modCount found on disk, so the
+        // next write's ++this.modificationCounter can't collide with a rebuilt entry.
+        this.modificationCounter = maxModCount;
+        await this.saveIndexSnapshot();
+    }
+
+    /**
+     * only used by rebuildIndex().
+     * Reads a data file's own JSON content and extracts the key plus the same
+     * {hash, created, modified, modCount} shape that updateIndex()/loadIndex()
+     * store in this.index, so a rebuilt entry is indistinguishable from a normal one.
+     * Returns null for anything that isn't a valid, key-bearing data file.
+     */
+    async readKeyFromFile(filePath) {
+        try {
+            const raw = await fsp.readFile(filePath, 'utf8');
+            const data = JSON.parse(raw);
+            if (!data._key) return null;
+
+            return {
+                key: data._key,
+                entry: {
+                    hash: data._hash,
+                    created: data._created,
+                    modified: data._modification || data._created,
+                    modCount: data._modCounter || 0
+                }
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * admin functions
+     */
+    handleAdminKeys(req, res) {
+        const filteredKeys = Array.from(this.index.keys())
+            .filter(key => this.checkPermissions(req.user, key, 'R'));
+        res.json({ keys: filteredKeys });
+    }
+
+    async handleAdminHealth(req, res) {
+        res.json({
+            uptime: process.uptime(),
+            storage: await this.getStorageStats(),
+            modifications: this.modificationCounter
+        });
+    }
+
+    /**
+     * Reports index size and disk usage of the data_root volume.
+     */
+    async getStorageStats() {
+        const stats = { indexedKeys: this.index.size };
+        try {
+            const fsStats = await fsp.statfs(this.config.data_root);
+            const totalBytes = fsStats.blocks * fsStats.bsize;
+            const freeBytes = fsStats.bfree * fsStats.bsize;
+            stats.disk = {
+                totalBytes,
+                freeBytes,
+                usedBytes: totalBytes - freeBytes
+            };
+        } catch (error) {
+            stats.disk = { error: error.message };
+        }
+        return stats;
+    }
+
+    handleAdminModCount(req, res) {
+        const since = parseInt(req.params.since);
+        const changes = Array.from(this.index.entries())
+            .filter(([_, data]) => data.modCount > since)
+            .map(([key, data]) => ({
+                key,
+                modCount: data.modCount,
+                modified: data.modified,
+                operation: data.operation
+            }));
+
+        res.json({
+            latestModCount: this.modificationCounter,
+            changes
+        });
+    }
+
+
+    /**
+     * shutdown
+     */
+    async shutdown() {
+        try {
+            // Save final index state
+            await this.saveIndexSnapshot();
+            console.log('Server shutdown complete');
+        } catch (err) {
+            console.error('Error during shutdown:', err);
+        }
+    }
+
+    async saveIndexSnapshot() {
+        const indexPath = this.getIndexArchivePath();
+
+        const entries = Array.from(this.index.entries())
+            .map(([key, data]) => `${key}|${data.hash}|${data.created}|${data.modified}`);
+
+        await fsp.writeFile(indexPath, entries.join('\n'));
+    }
+
+    async performIndexRotation() {
+        // Archive current index into index/archive/
+        await this.saveIndexSnapshot();
+
+        // Start new index with current state
+        const newEntries = Array.from(this.index.entries())
+            .map(([key, data]) =>
+                `${key}|${data.hash}|${data.created}|${data.modified}|${data.modCount}`
+            );
+
+        await fsp.writeFile(this.getCurrentIndexPath(), newEntries.join('\n'));
+
+        // Enforce retention on the archive directory now that a new snapshot was added.
+        await this.cleanupIndexArchive();
+    }
+
+    /**
+     * Enforces the retention policy on index/archive/, configured via
+     * this.config.index_archiving = { older_than_days, archiving_url }.
+     *
+     * - older_than_days (number): IMPLEMENTED. Any archived snapshot file
+     *   (index/archive/dj.index.YYYYMMDD) whose date, parsed from its filename,
+     *   is more than this many days in the past is deleted.
+     *
+     * - archiving_url (string): NOT IMPLEMENTED. This is a placeholder for a
+     *   future retention strategy delegated to an external service. The intended
+     *   contract: for each archived snapshot file, this server would send an HTTP
+     *   request to archiving_url carrying that file's content (e.g. as the request
+     *   body of a POST), letting the remote endpoint inspect it (for example, to
+     *   confirm it has already been copied to cold storage or long-term backup).
+     *   The endpoint's response would then tell this server, per file, whether it
+     *   is safe to delete or must be kept - so the external service owns the
+     *   archival/retention decision instead of this server deciding on a fixed
+     *   day count alone. Until this is implemented, archiving_url is ignored
+     *   (only a warning is logged if it's set) and older_than_days is the only
+     *   retention rule actually applied.
+     */
+    async cleanupIndexArchive() {
+        const archivingConfig = this.config.index_archiving;
+        if (!archivingConfig) return;
+
+        if (archivingConfig.archiving_url) {
+            console.warn(
+                'index_archiving.archiving_url is configured but not implemented yet; ' +
+                'only older_than_days retention is applied.'
+            );
+        }
+
+        const olderThanDays = archivingConfig.older_than_days;
+        if (!olderThanDays || olderThanDays <= 0) return;
+
+        const archiveDir = path.join(this.config.data_root, 'index', 'archive');
+        const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+
+        let files;
+        try {
+            files = await fsp.readdir(archiveDir);
+        } catch (error) {
+            if (error.code === 'ENOENT') return; // nothing archived yet
+            throw error;
+        }
+
+        for (const file of files) {
+            const match = file.match(/^dj\.index\.(\d{4})(\d{2})(\d{2})$/);
+            if (!match) continue; // ignore files that don't match the snapshot naming scheme
+
+            const [, year, month, day] = match;
+            const fileDate = Date.UTC(Number(year), Number(month) - 1, Number(day));
+
+            if (fileDate < cutoff) {
+                await fsp.unlink(path.join(archiveDir, file));
+            }
+        }
+    }
+
+    /**
+     * logins
+     */
+    // Login handler
+    async handleLogin(req, res) {
+        try {
+            const { username, password } = req.body;
+            const user = this.authenticateUser(username, password);
+
+            const token = jwt.sign(
+                {
+                    id: user.id,
+                    groups: user.groups
+                },
+                this.config.jwt_secret,
+                { expiresIn: '1h' }
+            );
+
+            res.json({
+                token,
+                user: {
+                    id: user.id,
+                    email: user.email,
+                    groups: user.groups
+                }
+            });
+        } catch (error) {
+            res.status(401).json({ error: 'Invalid credentials' });
+        }
+    }
+    // User authentication
+    authenticateUser(username, password) {
+        const user = this.accessData.users[username];
+
+        if (!user || !this.verifyPassword(password, user.password)) {
+            throw new Error('Invalid credentials');
+        }
+
+        return user;
+    }
+
+    /**
+     * Hashes a plaintext password for storage in access.json.
+     * Format: scrypt:<saltHex>:<hashHex>
+     */
+    hashPassword(password) {
+        const salt = crypto.randomBytes(16).toString('hex');
+        const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+        return `scrypt:${salt}:${hash}`;
+    }
+
+    /**
+     * Verifies a plaintext password against a scrypt hash produced by hashPassword().
+     */
+    verifyPassword(password, stored) {
+        if (typeof stored !== 'string' || typeof password !== 'string') return false;
+
+        const parts = stored.split(':');
+        if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+
+        const [, salt, hashHex] = parts;
+        const expected = Buffer.from(hashHex, 'hex');
+        const actual = crypto.scryptSync(password, salt, expected.length);
+
+        return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+    }
+
+    async readKeyData(req, key) {
+        const { dir, file } = this.getKeyPath(key);
+        const filePath = path.join(dir, file);
+
+        try {
+            const data = await fsp.readFile(filePath, 'utf8');
+            return JSON.parse(data);
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                throw new Error(`Failed to read key from disk: ${error.code}`);
+            }
+            throw new Error(`Failed to read key: ${error.message}`);
+        }
+    }
+    async writeKeyData(req, res, key, value) {
+        const { dir, file } = this.getKeyPath(key);
+        const filePath = path.join(dir, file);
+
+        try {
+            // Create directory structure if needed
+            await fsp.mkdir(dir, { recursive: true });
+
+            // Write data with metadata
+            var data = {}
+
+            if (value["_key"]) {
+                //structure has already informations
+                data = value;
+                data._modification = new Date().toISOString();
+                data._modCounter++;
+                // from now on, just use the value of the value
+                value = value.value;
+            } else {
+                // it's a new value. in this case, just add all the stuff to the value itself
+
+                data = {
+                    _key: key,
+                    _hash: this.getKeyPath(key).hash,
+                    _created: new Date().toISOString(),
+                    _modification: null,
+                    _modCounter: 0
+                };
+                data.value = value.value;
+            }
+
+            // if it is a file upload itself, then we have to assign the file to the object
+            if (res.locals.fileUpload) {
+                const upload = this.processFileUpload(req)
+                Object.assign(data, upload);
+            }
+
+            await fsp.writeFile(filePath, JSON.stringify(data));
+
+            // Update index
+            await this.updateIndex(req, key, 'WRITE');
+
+            return data;
+        } catch (error) {
+            throw new Error(`Failed to write key: ${error.message}`);
+        }
+    }
+
+    async deleteKeyData(req, key) {
+        const { dir, file } = this.getKeyPath(key);
+        const filePath = path.join(dir, file);
+
+        try {
+            // Delete data file
+            await fsp.unlink(filePath);
+        } catch (error) {
+            if (error.code !== 'ENOENT') { // Ignore "not found" errors
+                throw new Error(`Delete failed: ${error.message}`);
+            }
+        }
+
+        // Remove from index and log
+        const existingEntry = this.index.get(key);
+        await this.updateIndex(req, key, 'DELETE', existingEntry);
+        this.index.delete(key);
+
+        // Remove empty directories
+        await this.cleanupDirectories(dir);
+    }
+
+    async cleanupDirectories(dirPath) {
+        let currentDir = path.dirname(dirPath);
+        const rootDir = path.join(this.config.data_root, 'data');
+
+        while (currentDir !== rootDir) {
+            try {
+                const files = await fsp.readdir(currentDir);
+                if (files.length === 0) {
+                    await fsp.rmdir(currentDir);
+                }
+                currentDir = path.dirname(currentDir);
+            } catch (error) {
+                break;
+            }
+        }
+    }
+
+    _hasaOverwriteMethod(req) {
+        var returnvalue = null;
+        if (req.headers['x-method-override']) {
+            returnvalue = req.headers['x-method-override'].toUpperCase();
+        }
+        return returnvalue;
+    }
+
+    _isFileUpload(req) {
+        if (req.headers['content-type']?.startsWith('multipart/form-data')) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    _isBinaryRequest(req) {
+        if (req.query.binary !== undefined && req.query.binary !== null) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    _hasOverwriteExisting(req) {
+        var returnvalue = null;
+        if (req.headers['x-override-existing']) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    processFileUpload(req) {
+        if (!req.files?.file) {
+            throw new Error('No file uploaded');
+        }
+
+        
+
+        const file = req.files.file;
+        // latin to utf-8
+        const utf_filename = Buffer.from(file.name, 'latin1').toString('utf8');
+        const returnvalue = {
+            _type: 'file',
+            _meta: {
+                filename: utf_filename,
+                mimetype: file.mimetype,
+                size: file.size,
+                uploaded: new Date().toISOString(),
+                hash: this.hashBase64Sha256(file.data),
+                md5: file.md5
+            },
+            value: file.data.toString('base64')
+        };
+        return returnvalue;
+    }
+
+    /**
+     * HMac authentication implementation functions
+     * 
+     * begin
+     */
+    async handleDeviceAuth(req, res, next) {
+        try {
+            const [deviceId, timestamp, user, signature] = req.headers['x-device-auth'].split(':');
+
+            // Validate format
+            if (!deviceId || !timestamp || !signature || !user) {
+                throw new Error('Invalid auth header format: {deviceId}:{timestamp}:{user}:{signature}');
+            }
+
+            const timestampMs = parseInt(timestamp, 10);
+            if (!Number.isFinite(timestampMs)) {
+                throw new Error('Invalid timestamp');
+            }
+
+            // Check timestamp freshness
+            const now = Date.now();
+            if (Math.abs(now - timestampMs) > this.accessData.hmac_auth_settings.hmac_window * 1000) {
+                throw new Error(`Timestamp out of window. Server time: ${new Date(now).toISOString()}, timestamp: ${timestampMs}`);
+            }
+
+            // Get device secret
+            const device = this.accessData.devices[deviceId];
+            if (!device?.enabled) throw new Error('Device not registered');
+            if (!device?.user_list) throw new Error('Device is missing whitelist for users! ["user1", "user2", "user[0-9]{1,2}"]');
+
+            // IP whitelisting
+            if (device.allowed_ips && !this.checkIP(req.ip, device.allowed_ips)) {
+                throw new Error('IP not allowed');
+            }
+
+            // user
+            if (!this.accessData.users[user]) {
+                throw new Error('Unknown user');
+            }
+
+            if (!this.checkUserList(device.user_list, user)) {
+                throw new Error('User not in whitelist for the device!');
+            }
+
+            // Verify HMAC -- signed over the claimed identity (device + user) and the
+            // request being authorized, so the signature can't be replayed to claim a
+            // different user or a different request than the one it was issued for.
+            const expectedSignature = crypto
+                .createHmac('sha256', device.secret)
+                .update(`${deviceId}|${user}|${req.method}|${req.path}|${timestamp}`)
+                .digest('hex');
+
+            const signatureBuffer = Buffer.from(signature);
+            const expectedBuffer = Buffer.from(expectedSignature);
+            const signatureValid = signatureBuffer.length === expectedBuffer.length
+                && crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
+
+            if (!signatureValid) {
+                throw new Error('Invalid signature');
+            }
+
+            // if the HMAC authentication goes through, the add the user in to the request informations stack
+            req.user = this.accessData.users[user];
+
+            next();
+        } catch (err) {
+            res.status(401).json({ error: `Device auth failed: ${err.message}` });
+        }
+    }
+
+    checkIP(ip, cidrList) {
+        const ipaddr = require('ipaddr.js');
+        const addr = ipaddr.parse(ip);
+        return cidrList.some(cidr => {
+            const range = ipaddr.parseCIDR(cidr);
+            return addr.match(range);
+        });
+    }
+
+    /**
+     * runs the user against the user list to check, if the user is in whitelist
+     */
+    checkUserList(userList, user) {
+        return userList.some((pattern) => new RegExp(`^${pattern}$`, 'i').test(user));
+    }
+    /* end HMAC implementation */
+
+    /**
+     * implementation of file response.
+     * @param {i} fileData 
+     * @param {*} res 
+     * @param {*} req 
+     * @returns 
+     */
+    async handleFileResponse(fileData, res, req) {
+        try {
+            const buffer = Buffer.from(fileData.value, 'base64');
+            const contentType = fileData._meta.mimetype || '';
+
+            const safeFilename = fileData._meta.filename || 'download.pdf';
+            const disposition = contentDisposition(safeFilename, { type: 'inline' });
+
+            // Prüfen, ob es ein Bild ist
+            if (!this._isImage(contentType)) {
+                // console.log("Not an image, sending raw file");
+                res.set({
+                    'Content-Type': contentType,
+                    'Content-Length': buffer.length,
+                    'Content-Disposition': disposition
+                });
+                return res.send(buffer);
+            }
+
+            const options = res?.locals?.image || {};
+
+            let image = sharp(buffer)
+                .rotate();  // Exit-Orientation digital cameras store pictures always landscape, but have a orientation flag. if you call rotate without any parameter, it will value the orientation and rotate to the right position
+
+            if (options.width || options.height) {
+                const fit = options.fit || 'contain'; // contain, cover, fill, inside, outside
+                const withoutEnlargement = options.allowEnlarge === false;
+
+                image = image.resize({
+                    width: options.width,
+                    height: options.height,
+                    fit: fit,
+                    withoutEnlargement: withoutEnlargement
+                });
+
+                // Alignment Mapping
+                if (fit === 'cover' && (options.alignX || options.alignY)) {
+                    const position = this._mapAlignment(options.alignX, options.alignY);
+                    if (position) {
+                        image = image.resize({
+                            width: options.width,
+                            height: options.height,
+                            fit: 'cover',
+                            position: position
+                        });
+                    }
+                }
+            }
+
+            // Format Konvertierung wenn angegeben
+            if (options.format) {
+                if (options.format === 'jpeg' || options.format === 'jpg') {
+                    image = image.jpeg({
+                        quality: options.quality || 80 // optional Qualitätsparameter
+                    });
+                } else if (options.format === 'png') {
+                    image = image.png({
+                        compressionLevel: options.compressionLevel || 9
+                    });
+                }
+            }
+
+            const outputBuffer = await image.toBuffer();
+
+            // Content-Type aktualisieren falls gewandelt
+            const finalContentType = options.format === 'png' ? 'image/png'
+                : options.format === 'jpeg' || options.format === 'jpg' ? 'image/jpeg'
+                    : contentType;
+
+            res.set({
+                'Content-Type': finalContentType,
+                'Content-Length': outputBuffer.length,
+                'Content-Disposition': `inline; filename="${fileData._meta.filename}"`
+            });
+
+            res.send(outputBuffer);
+
+        } catch (err) {
+            console.error("Image processing error:", err);
+            res.status(500).send("Failed to process image");
+        }
+    }
+
+    // Hilfsfunktion zum Übersetzen von alignX / alignY zu Sharp-Positionen
+    _mapAlignment(alignX, alignY) {
+        // Sharp-Positionen: top, right top, right, right bottom, bottom, left bottom, left, left top, center
+        const horizontal = {
+            left: 'left',
+            center: '',
+            right: 'right'
+        };
+        const vertical = {
+            top: 'top',
+            center: '',
+            bottom: 'bottom'
+        };
+
+        const h = horizontal[alignX] || '';
+        const v = vertical[alignY] || '';
+
+        if (h && v) return `${h} ${v}`.trim();
+        if (h) return h;
+        if (v) return v;
+        return 'center'; // Default fallback
+    }
+
+    _isImage(contentType) {
+        return /^image\/(jpeg|png|gif|bmp|webp|tiff|heic|heif)$/.test(contentType.toLowerCase());
+    }
+
+    _hasImageModulation(req) {
+        const query = req.query || {};
+
+        const width = query.width ? parseInt(query.width, 10) : undefined;
+        const height = query.height ? parseInt(query.height, 10) : undefined;
+        const fit = query.fit || undefined;  // z.B. 'cover', 'contain'
+        const alignX = query.alignX || undefined; // 'left', 'center', 'right'
+        const alignY = query.alignY || undefined; // 'top', 'center', 'bottom'
+        const allowEnlarge = query.allowEnlarge !== undefined ? (query.allowEnlarge === 'true') : undefined;
+        const format = query.format ? query.format.toLowerCase() : undefined; // 'jpeg' oder 'png'
+        const quality = query.quality ? parseInt(query.quality, 10) : undefined;
+
+        // Falls gar nichts gesetzt wurde, return undefined
+        if (
+            width === undefined &&
+            height === undefined &&
+            fit === undefined &&
+            alignX === undefined &&
+            alignY === undefined &&
+            allowEnlarge === undefined &&
+            format === undefined &&
+            quality === undefined
+        ) {
+            return undefined;
+        }
+
+        // Setze nur die Felder die auch wirklich definiert sind
+        const result = {};
+
+        if (width !== undefined) result.width = width;
+        if (height !== undefined) result.height = height;
+        if (fit) result.fit = fit;
+        if (alignX) result.alignX = alignX;
+        if (alignY) result.alignY = alignY;
+        if (allowEnlarge !== undefined) result.allowEnlarge = allowEnlarge;
+        if (format) result.format = format;
+        if (quality !== undefined) result.quality = quality;
+
+        return result;
+    }
+
+
+    /**
+     * end of impleentation of file resposne
+     */
+
+    /**
+     * implementation wildcard key
+     */
+    async processWildcardKey(originalKey) {
+        if (!originalKey.includes('*')) return null;
+
+        const pattern = this.parseWildcardPattern(originalKey);
+        if (!pattern) return null;
+
+        return this.generateUniqueKey(pattern);
+    }
+
+    parseWildcardPattern(key) {
+        const match = key.match(/\*\{\s*type\s*:\s*([a-z]+)\s*\}/);
+        if (!match) return null;
+
+        const fullMatch = match[0];
+        const start = key.indexOf(fullMatch);
+        const end = start + fullMatch.length;
+
+        return {
+            prefix: key.substring(0, start),
+            type: match[1],
+            suffix: key.substring(end)
+        };
+
+    }
+
+    async generateUniqueKey(pattern) {
+        let generated;
+        let attempt = 0;
+
+        do {
+            switch (pattern.type) {
+                case 'inc':
+                    generated = await this.incrementalKey(pattern);
+                    break;
+                case 'random':
+                    generated = this.randomKey(pattern);
+                    break;
+                default:
+                    throw new Error('Invalid key generation type');
+            }
+
+            if (attempt++ > 100) {
+                throw new Error('Failed to generate unique key');
+            }
+        } while (this.index.has(generated));
+
+        return generated;
+    }
+
+    async incrementalKey(pattern) {
+        const prefix = pattern.prefix; //.replace(/\.$/, '');
+        const suffix = pattern.suffix; //.replace(/^\./, '');
+
+        // Find highest existing sequence number
+        let maxSeq = 0;
+        const regex = new RegExp(`^${prefix}([0-9]+)${suffix}$`);
+
+        for (const [key] of this.index) {
+            const match = key.match(regex);
+            if (match) {
+                const seq = parseInt(match[1]);
+                if (seq > maxSeq) maxSeq = seq;
+            }
+        }
+
+        return `${prefix}${maxSeq + 1}${suffix}`;
+    }
+
+    randomKey(pattern) {
+        const uuid = crypto.randomUUID().replace(/-/g, '');
+        return `${pattern.prefix}${uuid}${pattern.suffix}`;
+    }
+    /**
+     * end of implementation wildcard key
+     */
+
+    handleListKeys(req, res) {
+        const filter = {};
+        if (req.method === 'GET') {
+            // receive from parameter
+            filter.keys = req.query.keys || undefined;
+
+        } else if (req.method === 'POST') {
+            // receive 
+            if( req.body && req.body.keys ) {
+                filter.keys = req.body.keys || undefined;
+            }
+        } else {
+            res.json({ error: `HTTP Method ${req.method} is not allwed. Just POST and GET.` });
+        }
+        // filter permissions
+        var filteredKeys = Array.from(this.index.keys())
+            .filter((key) => {
+                return this.checkPermissions(req.user, key, 'R')
+            });
+        // filter names
+        if (filter.keys) {
+            filteredKeys = filteredKeys.filter((key) => {
+                return key.match(filter.keys);
+            })
+        }
+        res.json({ keys: filteredKeys });
+    }
+
+    /**
+     * begin MOVE implementation
+     */
+
+    // Enhanced handleMove implementation
+    async handleMove(req, res) {
+        try {
+
+            // 1. Universal body parsing
+            let body;
+            try {
+                body = await this.parseMoveBody(req);
+
+                if (!body.from || !body.to) {
+                    return res.status(400).json({
+                        error: 'Missing parameters',
+                        required: ['from', 'to'],
+                        received: Object.keys(body)
+                    });
+                }
+            } catch (parseError) {
+                return res.status(400).json({
+                    error: 'Invalid request body',
+                    details: parseError.message,
+                    supportedFormats: [
+                        'application/json',
+                        'text/plain (JSON string)',
+                        'application/x-www-form-urlencoded'
+                    ]
+                });
+            }
+
+            const { from, to: rawTo } = body;
+
+            // 1. Validate parameters
+            if (!from || !rawTo) {
+                return res.status(400).json({ error: 'Missing "from" or "to" in request body' });
+            }
+
+            // 2. Process wildcard in destination
+            let to = rawTo;
+            if (rawTo.includes('*')) {
+                try {
+                    to = await this.processWildcardKey(rawTo);
+                    if (!to) throw new Error('Failed to generate destination key from wildcard');
+                } catch (error) {
+                    return res.status(400).json({
+                        error: `Invalid destination wildcard: ${error.message}`
+                    });
+                }
+            }
+
+            // 3. Check source existence
+            if (!this.index.has(from)) {
+                return res.status(404).json({ error: `Source key "${from}" not found` });
+            }
+
+            // 4. Check target existence
+            const toExists = this.index.has(to);
+            if (toExists && !this._hasOverwriteExisting(req)) {
+                return res.status(400).json({
+                    error: `Target key "${to}" exists (use x-override-existing header)`,
+                    generatedKey: to // Return the actual generated key
+                });
+            }
+
+            // 5. Permission checks
+            // Delete permission on source
+            if (!this.checkPermissions(req.user, from, 'D')) {
+                return res.status(403).json({ error: 'Insufficient permissions to delete source' });
+            }
+
+            // Create/Update permission on target
+            const requiredToPerm = toExists ? 'U' : 'C';
+            if (!this.checkPermissions(req.user, to, requiredToPerm)) {
+                return res.status(403).json({
+                    error: `Insufficient permissions to ${toExists ? 'update' : 'create'} target`,
+                    requiredPermission: requiredToPerm,
+                    targetKey: to
+                });
+            }
+
+            // 6. Perform move operation
+            const data = await this.readKeyData(req, from);
+
+            // 7. change key name
+            if( data && data._key ) {
+                data._key = to;
+                if( !data._meta._key_history ) data._meta._key_history = [];
+                data._meta._key_history.push( { date: Date.now(), user: req.user.id, from: from, to: to });
+            }
+
+            await this.writeKeyData(req, res, to, data);
+            await this.deleteKeyData(req, from);
+
+            res.json({
+                success: true,
+                message: `Moved "${from}" to "${to}"`,
+                details: {
+                    from,
+                    to,
+                    generated: rawTo !== to, // Indicates if wildcard was resolved
+                    targetExisted: toExists
+                }
+            });
+
+        } catch (error) {
+            await this.logRequest(req, res, error);
+            res.status(500).json({
+                error: error.message,
+                code: error.code,
+                stack: this.config.debug ? error.stack : undefined
+            });
+        }
+    }
+    // Add new helper method to the class
+    async parseMoveBody(req) {
+        // Case 1: Already parsed JSON body (express.json() middleware)
+        if (_.isObject(req.body) && !Buffer.isBuffer(req.body)) {
+            return req.body;
+        }
+
+        // Case 2: Text-based body
+        const contentType = req.headers['content-type'] || 'text/plain';
+        const rawBody = req.body.toString('utf8');
+
+        try {
+            // Handle different content types
+            if (contentType === 'application/json' || contentType === 'text/plain') {
+                return JSON.parse(rawBody);
+            }
+
+            if (contentType === 'application/x-www-form-urlencoded') {
+                const parsed = {};
+                for (const [key, value] of new URLSearchParams(rawBody).entries()) {
+                    parsed[key] = value;
+                }
+                return parsed;
+            }
+
+            throw new Error(`Unsupported Content-Type: ${contentType}`);
+        } catch (error) {
+            throw new Error(`Body parsing failed: ${error.message}`);
+        }
+    }
+    /**
+     * end MOVE implementation
+     */
+
+    /**
+     * Hashes a base64 string using SHA-256 (fallback for BLAKE3)
+     * @param {string} base64 - The base64-encoded input
+     * @returns {string} hex hash
+     */
+    hashBase64Sha256(base64) {
+        const buffer = Buffer.from(base64, 'base64'); // decode base64 to raw bytes
+        const hasher = crypto.createHash('sha256');
+        hasher.update(buffer);
+        return hasher.digest('hex');
+    }
+}
+
+module.exports = DeepJSONServer;
