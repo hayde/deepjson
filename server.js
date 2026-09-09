@@ -102,7 +102,24 @@ class DeepJSONServer {
         // exposedHeaders: X-Renewed-Token carries the sliding-session token
         // (see authMiddleware()) - without this, browser-based clients can't
         // read it, even though the header is present in the raw response.
-        this.app.use(cors({ exposedHeaders: ['X-Renewed-Token'] }));
+        //
+        // origin: per-group allowlist (see getAllowedCorsOrigins()) for cases like
+        // an <img>/fetch pointing straight at a resized image's URL from another
+        // domain, outside the normal API-client flow. CORS itself can't be scoped
+        // to "this group only" - the browser's preflight carries no auth, so the
+        // server can't yet know which user/group is asking. What this actually
+        // enforces is the union of every group's allowed_origins, as one global
+        // whitelist; group membership only organizes which origin belongs to
+        // which client app in access.json, it isn't checked per request here.
+        // Backward-compatible default: if no group defines allowed_origins at all,
+        // every origin is still allowed, same as before this change.
+        this.app.use(cors({
+            origin: (origin, callback) => {
+                if (this.isOriginAllowed(origin)) return callback(null, true);
+                callback(new Error(`Origin not allowed by CORS: ${origin}`));
+            },
+            exposedHeaders: ['X-Renewed-Token']
+        }));
         this.app.use((req, res, next) => {
             if (req.secure) {
                 res.setHeader('Strict-Transport-Security', 'max-age=31536000');
@@ -180,8 +197,22 @@ class DeepJSONServer {
      */
     _setupSocketServer(expressServer) {
         this.io = new Server(expressServer, {
+            // socket.io keeps its own CORS config, separate from the Express
+            // middleware above - restricting one does not restrict the other.
+            //
+            // This covers BOTH transports: unlike a raw browser WebSocket, where
+            // CORS is never enforced, engine.io runs this check itself on the
+            // handshake, so a client using transports: ['websocket'] to skip
+            // polling is rejected here too (verified against both transports).
+            //
+            // No exposedHeaders here on purpose: the handshake authenticates once
+            // via the query-parameter token and never renews it, so there is no
+            // X-Renewed-Token to hand back (see authMiddleware()).
             cors: {
-                origin: '*',
+                origin: (origin, callback) => {
+                    if (this.isOriginAllowed(origin)) return callback(null, true);
+                    callback(new Error(`Origin not allowed by CORS: ${origin}`));
+                },
                 methods: ["GET", "POST"],
                 allowedHeaders: ["Authorization", "Content-Type"],
                 credentials: false
@@ -536,6 +567,38 @@ class DeepJSONServer {
         });
 
         return allowed;
+    }
+
+    /**
+     * Union of every group's `allowed_origins` (access.json), forming the CORS
+     * whitelist used in setupServer(). Optional per group, mirrors how
+     * device.allowed_ips works for HMAC devices: a group with no allowed_origins
+     * simply contributes nothing. Enforcement itself is global, not per-group -
+     * see the comment above the cors() call for why it can't be scoped tighter.
+     */
+    getAllowedCorsOrigins() {
+        const origins = new Set();
+        for (const group of Object.values(this.accessData.groups || {})) {
+            (group.allowed_origins || []).forEach(origin => origins.add(origin));
+        }
+        return origins;
+    }
+
+    /**
+     * Whether a request carrying this Origin header may talk to the server at all.
+     * Shared by the Express CORS middleware, socket.io's own CORS block and its
+     * allowRequest handshake check, so all three can't drift apart.
+     *
+     * Two deliberate pass-throughs:
+     * - empty whitelist: no group has opted in yet, so everything stays allowed,
+     *   exactly as it behaved before allowed_origins existed.
+     * - no Origin header: not a browser (curl, server-to-server, native client).
+     *   Such clients ignore CORS anyway, so refusing them here would buy nothing
+     *   while breaking legitimate integrations. Real protection is the JWT check.
+     */
+    isOriginAllowed(origin) {
+        const allowed = this.getAllowedCorsOrigins();
+        return allowed.size === 0 || !origin || allowed.has(origin);
     }
 
     checkAdmin(user) {
