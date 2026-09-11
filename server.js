@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const fs = require('fs'); // Regular fs for sync methods
 const fsp = require('fs').promises; // Promise-based fs
 const path = require('path');
-const { getScriptEngine } = require('./lib/scriptEngines');
+const { getScriptEngine, AVAILABLE_ENGINES, DEFAULT_ENGINE } = require('./lib/scriptEngines');
 const moment = require('moment');
 const _ = require('lodash');
 const https = require('https');
@@ -57,20 +57,241 @@ class DeepJSONServer {
 
     }
 
+    /**
+     * Body size limit for text/* writes to /keys/:key.
+     *
+     * `text_payload_limit` in dj.config is optional and only needs to be set when
+     * text writes should differ from everything else; otherwise `payload_limit`
+     * applies, and if that is missing too, the same 10mb default express.json()
+     * uses. Accepts what body-parser accepts: a byte count, or a size string
+     * such as "10mb" / "512kb".
+     */
+    getTextPayloadLimit() {
+        return this.config.text_payload_limit || this.config.payload_limit || '10mb';
+    }
+
     loadConfig() {
         const configPath = process.argv[2] || '/etc/deepjson/dj.config';
         // Use sync method during initialization
-        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        try {
+            return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        } catch (err) {
+            // Without this the operator gets a bare ENOENT or "Unexpected token"
+            // with no hint as to which file the server was even looking for.
+            throw new Error(`Could not load config "${configPath}": ${err.message}`);
+        }
     }
 
     loadAccessData() {
-        return JSON.parse(fs.readFileSync(this.config.access_file));
+        const accessPath = this.config.access_file;
+        try {
+            return JSON.parse(fs.readFileSync(accessPath, 'utf8'));
+        } catch (err) {
+            throw new Error(`Could not load access_file "${accessPath}": ${err.message}`);
+        }
     }
 
     async initialize() {
+        this.validateConfig();
         await this.createDirectories();
         await this.loadIndex();
         this.setupServer();
+    }
+
+    /**
+     * Fails fast on a broken dj.config or access.json, so the operator learns about
+     * it while the server is starting rather than when some unrelated request
+     * happens to hit the broken part. script_engine is the motivating example: it is
+     * only read inside executeScript(), so a typo there used to start up perfectly
+     * and then break the first script someone ran, looking like a script bug.
+     *
+     * Everything is collected first and reported together, so a misconfigured
+     * install can be fixed in one pass rather than one restart per mistake.
+     * Fatal = the server cannot work correctly; warnings are printed and startup
+     * continues.
+     */
+    validateConfig() {
+        const errors = [];
+        const warnings = [];
+        const cfg = this.config || {};
+        const access = this.accessData || {};
+
+        const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+        const requireText = (value, name) => {
+            if (typeof value !== 'string' || value.trim() === '') {
+                errors.push(`${name} is required and must be a non-empty string`);
+                return false;
+            }
+            return true;
+        };
+        const requireInt = (value, name, { min, max }) => {
+            const n = Number(value);
+            if (!Number.isInteger(n) || n < min || n > max) {
+                errors.push(`${name} must be an integer between ${min} and ${max} (got ${JSON.stringify(value)})`);
+                return false;
+            }
+            return true;
+        };
+
+        /* ---- dj.config ---- */
+
+        requireText(cfg.data_root, 'data_root');
+        requireText(cfg.access_file, 'access_file');
+
+        if (requireText(cfg.jwt_secret, 'jwt_secret') && cfg.jwt_secret.length < 32) {
+            warnings.push(`jwt_secret is only ${cfg.jwt_secret.length} characters; use a long random value (32+)`);
+        }
+
+        if (cfg.ssl?.enabled) {
+            requireInt(cfg.ssl.port, 'ssl.port', { min: 1, max: 65535 });
+            for (const field of ['key', 'cert']) {
+                if (requireText(cfg.ssl[field], `ssl.${field}`) && !fs.existsSync(cfg.ssl[field])) {
+                    errors.push(`ssl.${field} points to a file that does not exist: ${cfg.ssl[field]}`);
+                }
+            }
+        } else {
+            requireInt(cfg.port, 'port', { min: 1, max: 65535 });
+        }
+
+        // A sha256 hex digest is 64 characters and getKeyPath() consumes two per
+        // level, so more than 32 levels cannot be built from it.
+        requireInt(cfg.index_depth, 'index_depth', { min: 1, max: 32 });
+
+        // Byte sizes are handed straight to body-parser, which parses them with the
+        // `bytes` package. That package is only a transitive dependency here, so it
+        // must not be required directly just to validate; the shape is checked with
+        // a pattern instead.
+        const checkByteSize = (value, name) => {
+            if (value === undefined) return;
+            if (typeof value === 'number') {
+                if (!(value > 0)) {
+                    errors.push(`${name} must be a positive number of bytes (got ${JSON.stringify(value)})`);
+                }
+                return;
+            }
+            if (typeof value !== 'string' || !/^\s*\d+(\.\d+)?\s*(b|kb|mb|gb|tb|pb)?\s*$/i.test(value)) {
+                errors.push(`${name} must be a byte count or a size string like "10mb" / "512kb" (got ${JSON.stringify(value)})`);
+            }
+        };
+        checkByteSize(cfg.payload_limit, 'payload_limit');
+        checkByteSize(cfg.text_payload_limit, 'text_payload_limit');
+
+        if (cfg.script_engine !== undefined && !AVAILABLE_ENGINES.includes(cfg.script_engine)) {
+            errors.push(
+                `script_engine "${cfg.script_engine}" is unknown. Valid options: ` +
+                `${AVAILABLE_ENGINES.map(e => `"${e}"`).join(', ')} (omit the key to use "${DEFAULT_ENGINE}")`
+            );
+        }
+
+        if (cfg.script_execution_time_limit !== undefined
+            && !(Number(cfg.script_execution_time_limit) > 0)) {
+            errors.push(`script_execution_time_limit must be a positive number of milliseconds (got ${JSON.stringify(cfg.script_execution_time_limit)})`);
+        }
+
+        if (cfg.index_archiving !== undefined) {
+            if (!isPlainObject(cfg.index_archiving)) {
+                errors.push('index_archiving must be an object with older_than_days and/or archiving_url');
+            } else {
+                const { older_than_days, archiving_url } = cfg.index_archiving;
+                if (older_than_days !== undefined && !(Number(older_than_days) > 0)) {
+                    errors.push(`index_archiving.older_than_days must be a positive number of days (got ${JSON.stringify(older_than_days)})`);
+                }
+                if (older_than_days === undefined && !archiving_url) {
+                    warnings.push('index_archiving is set but has no older_than_days, so no archive snapshots will ever be deleted');
+                }
+                if (archiving_url !== undefined && archiving_url !== null && typeof archiving_url !== 'string') {
+                    errors.push('index_archiving.archiving_url must be a string or null');
+                }
+                if (archiving_url) {
+                    warnings.push('index_archiving.archiving_url is set but not implemented yet; only older_than_days is applied');
+                }
+            }
+        }
+
+        /* ---- access.json ---- */
+
+        if (!isPlainObject(access.users)) {
+            errors.push('access_file: "users" is missing or not an object');
+        } else if (Object.keys(access.users).length === 0) {
+            warnings.push('access_file: "users" is empty, nobody can log in');
+        }
+
+        if (!isPlainObject(access.groups)) {
+            errors.push('access_file: "groups" is missing or not an object');
+        }
+
+        if (isPlainObject(access.users) && isPlainObject(access.groups)) {
+            for (const [userId, user] of Object.entries(access.users)) {
+                if (!Array.isArray(user?.groups)) {
+                    errors.push(`access_file: user "${userId}" has no "groups" array`);
+                    continue;
+                }
+                for (const group of user.groups) {
+                    // checkPermissions() reads groups[group].rules directly, so an
+                    // unknown group name is a TypeError on the next request.
+                    if (!(group in access.groups)) {
+                        errors.push(`access_file: user "${userId}" references unknown group "${group}"`);
+                    }
+                }
+                if (user.password === undefined) {
+                    errors.push(`access_file: user "${userId}" has no password`);
+                } else if (typeof user.password === 'string' && !user.password.startsWith('scrypt:')) {
+                    errors.push(`access_file: user "${userId}" has a password that is not a scrypt hash; run hashPassword() and store the result`);
+                }
+            }
+        }
+
+        if (isPlainObject(access.groups)) {
+            for (const [groupName, group] of Object.entries(access.groups)) {
+                if (!Array.isArray(group?.rules)) {
+                    warnings.push(`access_file: group "${groupName}" has no "rules" array, it grants nothing`);
+                } else {
+                    group.rules.forEach((rule, i) => {
+                        const where = `access_file: group "${groupName}" rule #${i + 1}`;
+                        try {
+                            new RegExp(rule?.regex);
+                        } catch (err) {
+                            errors.push(`${where} has an invalid regex: ${err.message}`);
+                        }
+                        if (rule?.crudx !== undefined && !/^[01]{5}$/.test(rule.crudx)) {
+                            errors.push(`${where} has crudx "${rule.crudx}", expected 5 characters of 0/1`);
+                        } else if (rule?.crudx === undefined && rule?.crud !== undefined && !/^[01]{4}$/.test(rule.crud)) {
+                            errors.push(`${where} has crud "${rule.crud}", expected 4 characters of 0/1`);
+                        } else if (rule?.crudx === undefined && rule?.crud === undefined) {
+                            errors.push(`${where} has neither "crudx" nor "crud"`);
+                        }
+                    });
+                }
+
+                if (group?.allowed_origins !== undefined) {
+                    if (!Array.isArray(group.allowed_origins)) {
+                        errors.push(`access_file: group "${groupName}" has an "allowed_origins" that is not an array`);
+                    } else {
+                        group.allowed_origins.forEach((origin, i) => {
+                            // The silent killer: a bare JSON null (or any non-string)
+                            // still counts toward the whitelist size, so the
+                            // open-by-default fallback stays off while the entry can
+                            // never match. See isOriginAllowed() for the "null" case.
+                            if (typeof origin !== 'string' || origin.trim() === '') {
+                                errors.push(
+                                    `access_file: group "${groupName}" allowed_origins[${i}] is ${JSON.stringify(origin)}; ` +
+                                    'entries must be non-empty strings (to allow a file:// page use the quoted string "null")'
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        warnings.forEach(w => console.warn(`Config warning: ${w}`));
+
+        if (errors.length) {
+            throw new Error(
+                `Invalid configuration (${errors.length} problem${errors.length > 1 ? 's' : ''}):\n` +
+                errors.map(e => `  - ${e}`).join('\n')
+            );
+        }
     }
 
     async createDirectories() {
@@ -96,8 +317,17 @@ class DeepJSONServer {
         }));
 
 
-        // key requests could be text
-        this.app.use('/keys/:key', express.text({ type: 'text/*' }));
+        // key requests could be text.
+        //
+        // The limit has to be passed explicitly: without it express.text() falls
+        // back to body-parser's built-in 100kb default, which is far below
+        // payload_limit and silently caps the main key-write path (writing a key
+        // as text/* is the working route, so this limit is the one users hit).
+        // Precedence: text_payload_limit, then payload_limit, then 10mb.
+        this.app.use('/keys/:key', express.text({
+            type: 'text/*',
+            limit: this.getTextPayloadLimit()
+        }));
 
         // exposedHeaders: X-Renewed-Token carries the sliding-session token
         // (see authMiddleware()) - without this, browser-based clients can't
