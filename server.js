@@ -58,6 +58,25 @@ class DeepJSONServer {
     }
 
     /**
+     * Version of the running server, taken from package.json so there is exactly
+     * one place to bump it and it cannot drift from what is actually deployed.
+     *
+     * Read once and cached: package.json ships next to this file and does not
+     * change while the process runs. If it cannot be read the server still starts,
+     * since not knowing the version is never a reason to refuse service.
+     */
+    getServerVersion() {
+        if (this._serverVersion === undefined) {
+            try {
+                this._serverVersion = require('./package.json').version || null;
+            } catch {
+                this._serverVersion = null;
+            }
+        }
+        return this._serverVersion;
+    }
+
+    /**
      * Body size limit for text/* writes to /keys/:key.
      *
      * `text_payload_limit` in dj.config is optional and only needs to be set when
@@ -309,6 +328,10 @@ class DeepJSONServer {
     setupServer() {
         this.app = express();
 
+        // Express advertises itself with X-Powered-By on every response. It tells a
+        // client nothing useful and tells a scanner which stack to target, so it goes.
+        this.app.disable('x-powered-by');
+
         // Core middleware
         this.app.use(express.json({ limit: this.config.payload_limit || '10mb' }));
         this.app.use(fileUpload({
@@ -376,6 +399,11 @@ class DeepJSONServer {
             if (res.locals.fileUpload) res.locals.binaryRequest = false;
             next();
         });
+
+        // Identity and build info. Both sit behind authMiddleware, so they double as
+        // a login check, and each response carries a fresh X-Renewed-Token.
+        this.app.get('/version', this.handleVersion.bind(this));
+        this.app.get('/whoami', this.handleWhoami.bind(this));
 
         // Core routes
         this.app.route('/keys/:key')
@@ -1367,6 +1395,72 @@ class DeepJSONServer {
         } catch {
             return null;
         }
+    }
+
+    /**
+     * GET /version - deliberately tiny, so a client can use it as a frequent
+     * heartbeat. Behind authMiddleware, so it answers three questions at once:
+     * is the server up, is my token still valid, and what am I talking to.
+     * The renewed token rides along in X-Renewed-Token like on any other request.
+     */
+    handleVersion(req, res) {
+        res.json({ version: this.getServerVersion() });
+    }
+
+    /**
+     * GET /whoami - who the caller is and what they may do.
+     * Optional: ?keys=a,b,c resolves the effective permissions for those keys.
+     *
+     * About `rules`: these are returned for display and debugging only, never as
+     * something a client should evaluate itself. checkPermissions() walks every
+     * group and every rule in order and the LAST match wins, so a later rule with
+     * a 0 revokes what an earlier one granted, and the same rules in a different
+     * order produce a different answer. A client reimplementing the usual "any
+     * matching rule grants it" would disagree with the server exactly where it
+     * matters. Anything load-bearing goes through `permissions` below, which is
+     * computed by the same checkPermissions() that enforces on every request.
+     */
+    handleWhoami(req, res) {
+        const userEntry = this.accessData.users[req.user.id] || {};
+        const groups = userEntry.groups || [];
+
+        // Flattened in evaluation order, with the owning group attached, so the
+        // listing mirrors what the server actually walks through.
+        const rules = [];
+        for (const groupName of groups) {
+            const group = this.accessData.groups[groupName];
+            for (const rule of (group?.rules || [])) {
+                rules.push({ group: groupName, regex: rule.regex, crudx: rule.crudx ?? rule.crud });
+            }
+        }
+
+        const payload = {
+            version: this.getServerVersion(),
+            authenticated: true,
+            // Built field by field on purpose: the stored record also holds the
+            // password hash, and spreading it would hand that to the client.
+            user: { id: userEntry.id, email: userEntry.email },
+            groups,
+            isAdmin: this.checkAdmin(req.user),
+            rules,
+            rulesAreAdvisory: true
+        };
+
+        const requested = (req.query.keys || '').split(',').map(k => k.trim()).filter(Boolean);
+        if (requested.length) {
+            payload.permissions = {};
+            for (const key of requested) {
+                payload.permissions[key] = {
+                    C: this.checkPermissions(req.user, key, 'C'),
+                    R: this.checkPermissions(req.user, key, 'R'),
+                    U: this.checkPermissions(req.user, key, 'U'),
+                    D: this.checkPermissions(req.user, key, 'D'),
+                    X: this.checkPermissions(req.user, key, 'X')
+                };
+            }
+        }
+
+        res.json(payload);
     }
 
     /**
