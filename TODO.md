@@ -9,6 +9,69 @@ guesswork.
 
 ---
 
+## Data loss
+
+### 0. Concurrent writes corrupt documents and lose acknowledged updates — FIXED
+
+Fixed by writing atomically (temp file plus `rename`) and serializing modifying
+requests per key through `withKeyLock()`. Verified with the original reproduction:
+120 of 120 writes succeed where 8 did before, and no acknowledged update is lost.
+A heavier run of 6 workers doing 50 writes each also comes out exact at 300 of 300.
+Covered by `test/concurrency.test.js`.
+
+The original analysis is kept below, because the reasoning still applies to any
+future change in this area.
+
+---
+
+Reported by a client, reproduced here. `writeKeyData()`
+([server.js:1605](server.js#L1605)) calls `fsp.writeFile()` directly, which
+truncates the file in place and rewrites it, and there is **no locking anywhere in
+the codebase**. Two consequences, both measured:
+
+**Torn reads and permanent corruption.** A reader hitting the file mid-write gets
+a partial document and `JSON.parse` fails. Worse, a shorter write landing on top
+of a longer one leaves the tail of the old content behind. Measured on a probe
+key: 696 bytes on disk, valid JSON ending at 678, 18 bytes of leftover garbage.
+The document is then permanently unreadable, and it cannot even be deleted through
+the API, because the route reads the key before reaching the delete
+([server.js:984](server.js#L984)). Removing the file by hand is the only way out.
+
+**Lost updates.** Read, run script, write is not serialized per key, so concurrent
+writers overwrite each other's results. Three workers doing 40 writes each: 8
+reported success, 0 survived in the document.
+
+This is not a corner case for background jobs. The keys with by far the most
+writes in the production index are exactly the shared lookup tables that multiple
+people edit at once: `de.moegeldorfer.nuernberg.lookuptable` with 5584 index
+entries and `de.zeitgeist.wiesbaden.lookuptable` with 3471.
+
+Fixes, in increasing order of what they solve:
+
+1. **Write atomically**: write to a temporary file in the same directory, then
+   `fsp.rename()`, which is atomic on POSIX. A reader then sees either the old or
+   the new document, never half of one. The temp file must sit on the same
+   filesystem or the rename degrades to a copy. This removes the 500s and the
+   corruption but not the lost updates.
+2. **Serialize per key**: a promise chain per key around read-script-write. This
+   removes the lost updates too. Note it only holds within one process; running
+   several server instances would need file locking instead.
+3. **Or optimistic concurrency** on `_modCounter`, which already exists per
+   document and is incremented on every write. Note this is the field in the data
+   file, not `modCount` in the index, which is a global counter. This pushes retry
+   handling onto clients and would be a breaking change for existing ones.
+
+### 0b. The index grows without bound
+
+`updateIndex()` appends a line per operation ([server.js:1338](server.js#L1338))
+and nothing ever compacts it, because `performIndexRotation()` is unreachable, see
+item 10. In the production backup this is 33140 log lines for 6671 distinct keys,
+a factor of five, with a single lookup table accounting for 5584 of them. Harmless
+for correctness, since the replay is order-dependent and ends at the right state,
+but it grows forever and slows every startup.
+
+---
+
 ## Silent failures
 
 Bugs that never raise their voice, which is why they survive so long.

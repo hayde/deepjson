@@ -47,6 +47,9 @@ class DeepJSONServer {
         this.index = new Map();
         this.modificationCounter = 0;
 
+        // Tail of the pending operation chain per key, see withKeyLock().
+        this._keyLocks = new Map();
+
         // express server
         this.app = undefined;       // application 
         this.server = undefined;    // listening server
@@ -925,7 +928,59 @@ class DeepJSONServer {
         return null;
     }
 
+    /**
+     * Runs `fn` with exclusive access to one key, queueing behind anything already
+     * running for that same key. Different keys never wait on each other.
+     *
+     * Needed because a write is not one operation but three: read the document,
+     * run the script, write the result. Without serialization two requests both
+     * read the same starting state and the second silently discards the first
+     * one's result. Measured before this existed: three workers doing 40 writes
+     * each on one key, 8 acknowledged as successful, none of them surviving.
+     *
+     * Scope and limits: this is an in-process queue, so it holds for one server
+     * instance. Running several instances against the same data_root would need
+     * real file locking instead. A rejected operation must not break the chain for
+     * everyone queued behind it, hence the settle-either-way handling below.
+     */
+    async withKeyLock(key, fn) {
+        const previous = this._keyLocks.get(key) || Promise.resolve();
+
+        // Start only once the previous holder has settled, successfully or not.
+        const run = previous.then(() => fn(), () => fn());
+        // The queue tail must never reject, or the next waiter inherits the failure.
+        const tail = run.then(() => { }, () => { });
+        this._keyLocks.set(key, tail);
+
+        try {
+            return await run;
+        } finally {
+            // Drop the entry when nobody queued up behind us, so the map does not
+            // grow by one permanent entry for every key ever written.
+            if (this._keyLocks.get(key) === tail) this._keyLocks.delete(key);
+        }
+    }
+
+    /**
+     * Serializes anything that can modify a key, then hands off to the real handler.
+     *
+     * Reads deliberately skip the queue: writeKeyData() renames atomically, so a
+     * reader always sees one complete document, and making reads wait would stall
+     * them behind writes on exactly the hot keys that need throughput most.
+     *
+     * The effective method is what counts, since X-Method-Override rewrites it
+     * further down: a POST flagged as GET is a read and must not take the lock,
+     * while the reverse does modify and must.
+     */
     async handleKeyRequest(req, res) {
+        const effectiveMethod = (res.locals?.overwriteMethod || req.method || '').toUpperCase();
+        const modifies = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(effectiveMethod);
+
+        if (!modifies) return this._handleKeyRequest(req, res);
+        return this.withKeyLock(req.params.key, () => this._handleKeyRequest(req, res));
+    }
+
+    async _handleKeyRequest(req, res) {
         try {
             let key = req.params.key;
             let generatedKey = undefined;
@@ -1733,7 +1788,30 @@ class DeepJSONServer {
                 Object.assign(data, upload);
             }
 
-            await fsp.writeFile(filePath, JSON.stringify(data));
+            // Write to a temp file, then rename over the target. rename(2) is atomic
+            // on POSIX, so a concurrent reader always sees either the whole previous
+            // document or the whole new one, never a half-written file.
+            //
+            // fsp.writeFile() on its own truncates the target and writes into it,
+            // which had two failure modes under concurrency: a reader could catch
+            // the file mid-write and fail to parse it, and a shorter write landing
+            // on a longer one left the tail of the old content behind, corrupting
+            // the document permanently.
+            //
+            // The temp file has to live in the same directory, so that the rename
+            // stays within one filesystem and remains atomic instead of degrading
+            // into a copy. The random suffix keeps two concurrent writers from
+            // colliding on the temp file itself.
+            const payload = JSON.stringify(data);
+            const tmpPath = path.join(dir, `.${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+            try {
+                await fsp.writeFile(tmpPath, payload);
+                await fsp.rename(tmpPath, filePath);
+            } catch (writeError) {
+                // Never leave a stray temp file behind if the write or rename failed.
+                await fsp.unlink(tmpPath).catch(() => {});
+                throw writeError;
+            }
 
             // Update index
             await this.updateIndex(req, key, 'WRITE');
