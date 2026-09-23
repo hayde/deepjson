@@ -922,7 +922,13 @@ class DeepJSONServer {
                 http_method: req.method,
                 key: data ? data._key : undefined,
                 hash: data ? data._hash : undefined,
-                response: null
+                // Deliberately NOT seeded with null. The caller distinguishes
+                // "the script never assigned response" from "the script set it to
+                // null", and only undefined can carry the first meaning: an
+                // untouched response stays undefined and JSON.stringify drops it
+                // from the payload entirely, while an explicit null survives as
+                // null. Seeding it with null made the two indistinguishable.
+                response: undefined
             })
         };
         return null;
@@ -1049,8 +1055,14 @@ class DeepJSONServer {
                 // add the options to the response
                 response.options = {};
 
+                // These three checks ask "was it assigned", never "is it truthy".
+                // Testing truthiness rejected scripts that legitimately produced 0,
+                // false or an empty string, and on a write it treated an explicit
+                // null as "unset" and sent the entire stored document back instead.
+                // See processScriptBody(): response is left undefined precisely so
+                // that undefined can mean "never assigned" here.
                 if (req.modifiable_method) {
-                    if (!response.data) {
+                    if (response.data === undefined) {
                         // a modifiable call needs to set the "data" variable in the script!
                         response.options.status = 400;
                         response.options.error = { error: 'script is a modifiable call, but misses to set the "data" value inside the script!' };
@@ -1059,14 +1071,14 @@ class DeepJSONServer {
                         response.options.status = 200;
                         response.options.content = "json";
                         response.data = { ...data, value: response.data, custom: response.custom };
-                        // if the response is not set, then put the data into the response values
-                        if (!response.response) {
+                        // if the response was never assigned, fall back to the stored value
+                        if (response.response === undefined) {
                             response.response = response.data.value;
                         }
                     }
                 } else if (!req.modifiable_method) {
-                    // if the response.response is set, use that, otherwise use the original data
-                    if (response.response) {
+                    // if the response.response was assigned, use it, whatever its value
+                    if (response.response !== undefined) {
                         // do nothing :)
                         response.options.status = 200;
                         response.options.content = "json";

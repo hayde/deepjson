@@ -299,6 +299,59 @@ test('one failing script does not poison the next one', async () => {
     assertDeep(r.body, { danach: 'laeuft weiter' });
 });
 
+
+/* ------------------------------------------------------------------ */
+/* F - falsy values across the boundary                                */
+/* ------------------------------------------------------------------ */
+
+group('F  Falsy values (0, false, "", null)');
+
+test('a read script may return any falsy value, not just truthy ones', async () => {
+    // These used to be refused with 403, because the server tested `response`
+    // for truthiness where it meant "was it assigned". A script legitimately
+    // producing 0, false or "" was indistinguishable from one producing nothing.
+    const key = await seed(`${RUN}.falsy`, { x: 1 });
+    for (const [label, expr] of [['0', '0'], ['false', 'false'], ["''", '""'], ['null', 'null']]) {
+        const r = await runScript(`response = ${expr};`, { read: true, key });
+        assert(r.status === 200, `response = ${label} was refused with HTTP ${r.status}`);
+    }
+});
+
+test('a read script that never assigns `response` is still refused', async () => {
+    // The guard has to survive the fix above: unset must stay distinguishable
+    // from "set to something falsy".
+    const key = await seed(`${RUN}.falsy2`, { x: 1 });
+    const r = await runScript('var unrelated = 1;', { read: true, key });
+    assert(r.status === 403, `expected 403, got ${r.status}`);
+});
+
+test('a write script may store any falsy value', async () => {
+    for (const [label, expr] of [['0', '0'], ['false', 'false'], ["''", '""']]) {
+        const r = await runScript(`data = ${expr};`);
+        assert(r.status === 200 || r.status === 201, `data = ${label} was refused with HTTP ${r.status}`);
+    }
+});
+
+test('a write script that never assigns `data` on a new key is still refused', async () => {
+    const r = await runScript('var unrelated = 1;');
+    assert(r.status === 400, `expected 400, got ${r.status}`);
+});
+
+test('`response = null` on a write returns null, not the whole document', async () => {
+    // Previously null counted as "unset", so the server substituted the entire
+    // stored value. On a large lookup table that meant megabytes per idle poll.
+    const key = await seed(`${RUN}.nullresp`, { big: 'x'.repeat(500) });
+    const r = await runScript('data = { a: 1 }; response = null;', { read: false, key, override: true });
+    assert(r.status === 200 || r.status === 201, `HTTP ${r.status}`);
+    assert(r.body === null, `expected null, got ${JSON.stringify(r.body).slice(0, 80)}`);
+});
+
+test('a write script that never assigns `response` still falls back to the new value', async () => {
+    const r = await runScript('data = { fresh: "value" };');
+    assert(r.status === 200 || r.status === 201, `HTTP ${r.status}`);
+    assertDeep(r.body, { fresh: 'value' });
+});
+
 /* ------------------------------------------------------------------ */
 /* assertions + runner                                                 */
 /* ------------------------------------------------------------------ */
