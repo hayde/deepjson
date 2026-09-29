@@ -135,26 +135,26 @@ Decide whether last-match-wins is the intended semantic. If it is, document it
 loudly. If it is not, the likely intent is "deny wins" or "first match wins",
 and either is a behavioural change that needs care.
 
-### 5. `deepjson-server-setup.sh` generates a broken configuration
+### 5. `scripts/setup.sh` generates a broken configuration
 
 Four faults, all silent, all in the generated result rather than the script run:
 
-- **`hmac_øauth_settings`** ([line 54](deepjson-server-setup.sh#L54)) contains a `ø`.
+- **`hmac_øauth_settings`** ([line 54](scripts/setup.sh#L54)) contains a `ø`.
   The code reads `hmac_auth_settings`, so `device_auth_enabled: true` is never
   seen and HMAC device authentication is off while the config claims otherwise.
-- **`socketServer` nesting** ([line 29](deepjson-server-setup.sh#L29)): the code reads
+- **`socketServer` nesting** ([line 29](scripts/setup.sh#L29)): the code reads
   `preventDuplicateSessionConnections`, `allowMultipleSessionConnections` and
   `maxClientsPerSession` at the top level. Nested, they do nothing:
   `clients.length >= undefined` is always false, so the per-session client limit
   never applies.
-- **Seeded `dj.index` with `#` comments** ([line 87](deepjson-server-setup.sh#L87)):
+- **Seeded `dj.index` with `#` comments** ([line 87](scripts/setup.sh#L87)):
   `loadIndex()` knows nothing about comment lines and turns them into two real
   index entries keyed `"# Initial DeepJSON index file"` and `"# Format: key"`.
   The file should simply be empty.
 - **`emptySessionTTL` is never set.** A `setTimeout` with `undefined` fires almost
   immediately, so empty sessions would be reaped at once.
 
-Also: **`valid_until`** on the device ([line 50](deepjson-server-setup.sh#L50)) is
+Also: **`valid_until`** on the device ([line 50](scripts/setup.sh#L50)) is
 never evaluated anywhere. The field implies an expiry date that does not exist.
 
 ---
