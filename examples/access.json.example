@@ -1,0 +1,52 @@
+{
+  "_comment": "Users, groups and device credentials. Copy to the path named by access_file in dj.config. Passwords MUST be scrypt hashes: node bin/hash-password.js <password>",
+
+  "users": {
+    "admin": {
+      "id": "admin",
+      "email": "admin@example.com",
+      "password": "scrypt:REPLACE:REPLACE",
+      "groups": ["superadmin"]
+    },
+    "editor": {
+      "id": "editor",
+      "email": "editor@example.com",
+      "password": "scrypt:REPLACE:REPLACE",
+      "groups": ["editors"]
+    }
+  },
+
+  "_comment_groups": "crudx is five flags in order: Create, Read, Update, Delete, eXecute. The LAST matching rule wins, so order matters and a later 0 revokes an earlier 1.",
+  "groups": {
+    "superadmin": {
+      "rules": [
+        { "regex": ".*", "crudx": "11111" }
+      ]
+    },
+    "editors": {
+      "rules": [
+        { "regex": "^reports\\..*", "crudx": "11110" },
+        { "regex": "^reports\\.locked\\..*", "crudx": "01000" }
+      ],
+      "_comment_origins": "Browser origins allowed to call the API. Omit entirely to allow all. Exact string match, no wildcards. Use the quoted string \"null\" only for local file:// pages, never in production.",
+      "allowed_origins": [
+        "https://app.example.com"
+      ]
+    }
+  },
+
+  "_comment_hmac": "Device authentication via the X-Device-Auth header, separate from user JWTs.",
+  "hmac_auth_settings": {
+    "device_auth_enabled": false,
+    "hmac_window": 300
+  },
+  "devices": {
+    "sensor-1": {
+      "id": "sensor-1",
+      "secret": "REPLACE_WITH_A_RANDOM_SECRET",
+      "enabled": true,
+      "allowed_ips": ["192.168.1.0/24"],
+      "user_list": ["service-account"]
+    }
+  }
+}
