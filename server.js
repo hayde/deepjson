@@ -92,6 +92,63 @@ class DeepJSONServer {
         return this.config.text_payload_limit || this.config.payload_limit || '10mb';
     }
 
+    /**
+     * Body size limit for one specific key, from `key_payload_limits` in dj.config:
+     *
+     *   "key_payload_limits": [
+     *     { "regex": "^uploads\\.bulk\\..*", "limit": "500mb" },
+     *     { "regex": "^media\\..*",          "limit": "100mb" },
+     *     { "regex": "^.*",                  "limit": "10mb"  }
+     *   ]
+     *
+     * FIRST match wins, so entries run from most specific to least and a catch-all
+     * belongs last. This deliberately differs from checkPermissions(), where the
+     * last match wins instead, because that ordering surprises everyone who meets
+     * it (see TODO item 4).
+     *
+     * The list is entirely optional, and so is a catch-all inside it. If the list
+     * is missing, empty, or nothing matches, the ordinary default applies:
+     * text_payload_limit, then payload_limit, then 10mb. So a key that no rule
+     * mentions, or a key that does not exist yet, still gets a sane limit rather
+     * than none.
+     */
+    getPayloadLimitForKey(key) {
+        const rules = this.config.key_payload_limits;
+
+        if (Array.isArray(rules) && typeof key === 'string') {
+            for (const rule of rules) {
+                if (!rule || typeof rule.regex !== 'string' || rule.limit === undefined) continue;
+                try {
+                    if (new RegExp(rule.regex).test(key)) return rule.limit;
+                } catch {
+                    // A malformed regex is rejected by validateConfig() at startup.
+                    // Skipping it here keeps a live server serving rather than
+                    // failing every upload over one bad entry.
+                }
+            }
+        }
+
+        return this.getTextPayloadLimit();
+    }
+
+    /**
+     * body-parser instance for one limit value, cached.
+     *
+     * The limit is only known once the key is known, so the parser cannot be built
+     * at startup like it used to be. Building one per request would re-normalize
+     * the options every time, and there are only ever as many distinct limits as
+     * the config defines, so they are cached by limit instead.
+     */
+    _textParserFor(limit) {
+        if (!this._textParsers) this._textParsers = new Map();
+        let parser = this._textParsers.get(limit);
+        if (!parser) {
+            parser = express.text({ type: 'text/*', limit });
+            this._textParsers.set(limit, parser);
+        }
+        return parser;
+    }
+
     loadConfig() {
         const configPath = process.argv[2] || '/etc/deepjson/dj.config';
         // Use sync method during initialization
@@ -197,6 +254,56 @@ class DeepJSONServer {
         };
         checkByteSize(cfg.payload_limit, 'payload_limit');
         checkByteSize(cfg.text_payload_limit, 'text_payload_limit');
+
+        if (cfg.key_payload_limits !== undefined) {
+            if (!Array.isArray(cfg.key_payload_limits)) {
+                errors.push('key_payload_limits must be an array of { regex, limit } entries');
+            } else {
+                cfg.key_payload_limits.forEach((rule, i) => {
+                    const where = `key_payload_limits[${i}]`;
+                    if (!isPlainObject(rule)) {
+                        errors.push(`${where} must be an object with "regex" and "limit"`);
+                        return;
+                    }
+                    if (typeof rule.regex !== 'string') {
+                        errors.push(`${where}.regex is required and must be a string`);
+                    } else {
+                        try {
+                            new RegExp(rule.regex);
+                        } catch (err) {
+                            errors.push(`${where}.regex does not compile: ${err.message}`);
+                        }
+                    }
+                    checkByteSize(rule.limit, `${where}.limit`);
+                    if (rule.limit === undefined) {
+                        errors.push(`${where}.limit is required`);
+                    }
+
+                    // A catch-all swallows everything after it, since the first
+                    // match wins. Almost always a mistake unless it is last.
+                    if (/^\^?\.\*\$?$/.test(rule.regex) && i < cfg.key_payload_limits.length - 1) {
+                        warnings.push(
+                            `${where} is a catch-all ("${rule.regex}") but ${cfg.key_payload_limits.length - 1 - i} ` +
+                            'entries follow it; first match wins, so those can never apply'
+                        );
+                    }
+
+                    // A single string cannot exceed 512MB in V8, and a document is
+                    // serialized whole before being written, with escaping adding
+                    // to it. Anything approaching that fails at write time in a way
+                    // that depends on the content, so it is worth saying up front.
+                    const mb = typeof rule.limit === 'string' && /^(\d+(?:\.\d+)?)\s*mb$/i.exec(rule.limit);
+                    const bytes = mb ? Number(mb[1]) * 1024 * 1024 : (typeof rule.limit === 'number' ? rule.limit : 0);
+                    if (bytes > 256 * 1024 * 1024) {
+                        warnings.push(
+                            `${where}.limit is ${rule.limit}; documents are serialized as one string and V8 refuses ` +
+                            'any string over 512MB, so large payloads can fail at write time depending on how much ' +
+                            'JSON escaping their content needs'
+                        );
+                    }
+                });
+            }
+        }
 
         if (cfg.script_engine !== undefined && !AVAILABLE_ENGINES.includes(cfg.script_engine)) {
             errors.push(
@@ -349,11 +456,14 @@ class DeepJSONServer {
         // back to body-parser's built-in 100kb default, which is far below
         // payload_limit and silently caps the main key-write path (writing a key
         // as text/* is the working route, so this limit is the one users hit).
-        // Precedence: text_payload_limit, then payload_limit, then 10mb.
-        this.app.use('/keys/:key', express.text({
-            type: 'text/*',
-            limit: this.getTextPayloadLimit()
-        }));
+        //
+        // It is resolved per request rather than once at startup, because
+        // key_payload_limits lets it depend on which key is being written. See
+        // getPayloadLimitForKey() for the precedence.
+        this.app.use('/keys/:key', (req, res, next) => {
+            const limit = this.getPayloadLimitForKey(req.params.key);
+            return this._textParserFor(limit)(req, res, next);
+        });
 
         // exposedHeaders: X-Renewed-Token carries the sliding-session token
         // (see authMiddleware()) - without this, browser-based clients can't

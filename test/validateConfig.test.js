@@ -89,6 +89,83 @@ describe('validateConfig - dj.config', () => {
     });
 });
 
+describe('getPayloadLimitForKey', () => {
+    // First match wins, so entries run most specific first and a catch-all goes
+    // last. Deliberately the opposite of checkPermissions(), where the last match
+    // wins and surprises people.
+    const withRules = (rules, key, rest = {}) => {
+        const srv = Object.create(DeepJSONServer.prototype);
+        srv.config = { payload_limit: '10mb', key_payload_limits: rules, ...rest };
+        return srv.getPayloadLimitForKey(key);
+    };
+
+    const rules = [
+        { regex: '^uploads\\.bulk\\..*', limit: '500mb' },
+        { regex: '^media\\..*', limit: '100mb' },
+        { regex: '^.*', limit: '10mb' }
+    ];
+
+    test('the first matching rule wins', () => {
+        assert.strictEqual(withRules(rules, 'uploads.bulk.video'), '500mb');
+        assert.strictEqual(withRules(rules, 'media.photo'), '100mb');
+    });
+
+    test('a trailing catch-all covers everything else', () => {
+        assert.strictEqual(withRules(rules, 'reports.2026.q3'), '10mb');
+    });
+
+    test('a catch-all placed first shadows every later rule', () => {
+        const shadowed = [{ regex: '^.*', limit: '10mb' }, { regex: '^uploads\\..*', limit: '500mb' }];
+        assert.strictEqual(withRules(shadowed, 'uploads.big'), '10mb');
+    });
+
+    test('no match falls back to the ordinary default, not to no limit', () => {
+        assert.strictEqual(withRules([{ regex: '^nope$', limit: '99mb' }], 'other.key'), '10mb');
+    });
+
+    test('an absent or empty list falls back too', () => {
+        assert.strictEqual(withRules(undefined, 'any.key'), '10mb');
+        assert.strictEqual(withRules([], 'any.key'), '10mb');
+    });
+
+    test('the fallback still honours text_payload_limit', () => {
+        assert.strictEqual(withRules([], 'any.key', { text_payload_limit: '25mb' }), '25mb');
+    });
+
+    test('a key that is missing entirely still gets a limit', () => {
+        assert.strictEqual(withRules(rules, undefined), '10mb');
+    });
+
+    test('a malformed entry is skipped rather than breaking every upload', () => {
+        const broken = [{ regex: '[unclosed', limit: '99mb' }, { regex: '^ok\\..*', limit: '50mb' }];
+        assert.strictEqual(withRules(broken, 'ok.thing'), '50mb');
+    });
+});
+
+describe('validateConfig - key_payload_limits', () => {
+    const cfgWith = (rules) => ({ ...validConfig(), key_payload_limits: rules });
+
+    test('a well-formed list passes', () => {
+        assert.doesNotThrow(validate(cfgWith([
+            { regex: '^big\\..*', limit: '100mb' },
+            { regex: '^.*', limit: '10mb' }
+        ])));
+    });
+
+    test('a non-array is rejected', () => {
+        assert.throws(validate(cfgWith({ regex: '.*', limit: '10mb' })), /must be an array/);
+    });
+
+    test('a regex that does not compile is rejected at startup', () => {
+        assert.throws(validate(cfgWith([{ regex: '[unclosed', limit: '10mb' }])), /does not compile/);
+    });
+
+    test('a missing or nonsensical limit is rejected', () => {
+        assert.throws(validate(cfgWith([{ regex: '^a' }])), /limit is required/);
+        assert.throws(validate(cfgWith([{ regex: '^a', limit: 'huge' }])), /must be a byte count/);
+    });
+});
+
 describe('getTextPayloadLimit', () => {
     // Guards the limit for text/* writes to /keys/:key. Without an explicit limit
     // express.text() silently falls back to body-parser's 100kb default, which is

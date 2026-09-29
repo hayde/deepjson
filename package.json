@@ -3,6 +3,14 @@
   "version": "1.0.1",
   "description": "",
   "main": "main.js",
+  "files": [
+    "main.js",
+    "server.js",
+    "lib/",
+    "bin/hash-password.js",
+    "docs/",
+    "examples/"
+  ],
   "scripts": {
     "start": "node main.js /etc/deepjson/dj.config",
     "test": "node --test test/"
