@@ -1,0 +1,47 @@
+{
+  "_comment": "Complete DeepJSON server configuration. Copy to /etc/deepjson/dj.config and edit. JSON has no comment syntax, so the _comment keys below are ignored by the server and can be deleted. Full reference: docs/CONFIGURATION.md",
+
+  "data_root": "/var/lib/deepjson",
+  "access_file": "/etc/deepjson/access.json",
+
+  "port": 3000,
+  "ssl": {
+    "enabled": false,
+    "port": 8443,
+    "key": "/etc/ssl/private/deepjson.key",
+    "cert": "/etc/ssl/certs/deepjson.crt"
+  },
+
+  "_comment_jwt_secret": "REQUIRED. Generate with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\". Never reuse between environments.",
+  "jwt_secret": "REPLACE_ME_WITH_64_RANDOM_HEX_CHARACTERS",
+
+  "_comment_index_depth": "CANNOT be changed once data exists, existing documents would become unreachable.",
+  "index_depth": 3,
+
+  "index_archiving": {
+    "older_than_days": 30,
+    "archiving_url": null
+  },
+
+  "payload_limit": "10mb",
+  "text_payload_limit": "10mb",
+
+  "_comment_key_payload_limits": "Optional. First match wins, so a catch-all belongs last. Omit the whole list to use text_payload_limit everywhere.",
+  "key_payload_limits": [
+    { "regex": "^uploads\\.bulk\\..*", "limit": "100mb" },
+    { "regex": "^media\\..*", "limit": "30mb" },
+    { "regex": "^.*", "limit": "10mb" }
+  ],
+
+  "script_engine": "wasm",
+  "script_execution_time_limit": 5000,
+
+  "_comment_sessions": "Set these two explicitly if you use WebSocket sessions. Omitting emptySessionTTL tears empty channels down immediately; omitting maxClientsPerSession disables the limit entirely.",
+  "emptySessionTTL": 60000,
+  "maxClientsPerSession": 10,
+  "allowMultipleSessionConnections": true,
+  "preventDuplicateSessionConnections": false,
+
+  "_comment_debug": "Leave false in production, true exposes stack traces in error responses.",
+  "debug": false
+}
