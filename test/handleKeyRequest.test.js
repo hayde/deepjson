@@ -32,14 +32,19 @@ function makeRes(overwriteMethod) {
 }
 
 async function run({ method, overwriteMethodHeader, key }) {
-    const harness = {
+    // Prototype-linked, because handleKeyRequest() now routes write methods through
+    // withKeyLock() before reaching the guard under test. The lock itself is covered
+    // in concurrency.test.js; here it just has to be present and functional.
+    const harness = Object.create(DeepJSONServer.prototype);
+    Object.assign(harness, {
         index: new Map(),
+        _keyLocks: new Map(),
         // Sentinel: throwing here proves the guard let the request through to
         // actual key generation. handleKeyRequest's own try/catch turns this
         // into a 500 response carrying the sentinel message.
         processWildcardKey: async () => { throw new Error(REACHED_GENERATION); },
         logRequest: async () => {}
-    };
+    });
     const req = makeReq({ method, overwriteMethodHeader, key });
     const res = makeRes(overwriteMethodHeader ? overwriteMethodHeader.toUpperCase() : null);
     await DeepJSONServer.prototype.handleKeyRequest.call(harness, req, res);
