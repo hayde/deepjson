@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const fs = require('fs'); // Regular fs for sync methods
 const fsp = require('fs').promises; // Promise-based fs
 const path = require('path');
-const { getScriptEngine } = require('./lib/scriptEngines');
+const { getScriptEngine, AVAILABLE_ENGINES, DEFAULT_ENGINE } = require('./lib/scriptEngines');
 const moment = require('moment');
 const _ = require('lodash');
 const https = require('https');
@@ -47,6 +47,9 @@ class DeepJSONServer {
         this.index = new Map();
         this.modificationCounter = 0;
 
+        // Tail of the pending operation chain per key, see withKeyLock().
+        this._keyLocks = new Map();
+
         // express server
         this.app = undefined;       // application 
         this.server = undefined;    // listening server
@@ -57,20 +60,260 @@ class DeepJSONServer {
 
     }
 
+    /**
+     * Version of the running server, taken from package.json so there is exactly
+     * one place to bump it and it cannot drift from what is actually deployed.
+     *
+     * Read once and cached: package.json ships next to this file and does not
+     * change while the process runs. If it cannot be read the server still starts,
+     * since not knowing the version is never a reason to refuse service.
+     */
+    getServerVersion() {
+        if (this._serverVersion === undefined) {
+            try {
+                this._serverVersion = require('./package.json').version || null;
+            } catch {
+                this._serverVersion = null;
+            }
+        }
+        return this._serverVersion;
+    }
+
+    /**
+     * Body size limit for text/* writes to /keys/:key.
+     *
+     * `text_payload_limit` in dj.config is optional and only needs to be set when
+     * text writes should differ from everything else; otherwise `payload_limit`
+     * applies, and if that is missing too, the same 10mb default express.json()
+     * uses. Accepts what body-parser accepts: a byte count, or a size string
+     * such as "10mb" / "512kb".
+     */
+    getTextPayloadLimit() {
+        return this.config.text_payload_limit || this.config.payload_limit || '10mb';
+    }
+
     loadConfig() {
         const configPath = process.argv[2] || '/etc/deepjson/dj.config';
         // Use sync method during initialization
-        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        try {
+            return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        } catch (err) {
+            // Without this the operator gets a bare ENOENT or "Unexpected token"
+            // with no hint as to which file the server was even looking for.
+            throw new Error(`Could not load config "${configPath}": ${err.message}`);
+        }
     }
 
     loadAccessData() {
-        return JSON.parse(fs.readFileSync(this.config.access_file));
+        const accessPath = this.config.access_file;
+        try {
+            return JSON.parse(fs.readFileSync(accessPath, 'utf8'));
+        } catch (err) {
+            throw new Error(`Could not load access_file "${accessPath}": ${err.message}`);
+        }
     }
 
     async initialize() {
+        this.validateConfig();
         await this.createDirectories();
         await this.loadIndex();
         this.setupServer();
+    }
+
+    /**
+     * Fails fast on a broken dj.config or access.json, so the operator learns about
+     * it while the server is starting rather than when some unrelated request
+     * happens to hit the broken part. script_engine is the motivating example: it is
+     * only read inside executeScript(), so a typo there used to start up perfectly
+     * and then break the first script someone ran, looking like a script bug.
+     *
+     * Everything is collected first and reported together, so a misconfigured
+     * install can be fixed in one pass rather than one restart per mistake.
+     * Fatal = the server cannot work correctly; warnings are printed and startup
+     * continues.
+     */
+    validateConfig() {
+        const errors = [];
+        const warnings = [];
+        const cfg = this.config || {};
+        const access = this.accessData || {};
+
+        const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+        const requireText = (value, name) => {
+            if (typeof value !== 'string' || value.trim() === '') {
+                errors.push(`${name} is required and must be a non-empty string`);
+                return false;
+            }
+            return true;
+        };
+        const requireInt = (value, name, { min, max }) => {
+            const n = Number(value);
+            if (!Number.isInteger(n) || n < min || n > max) {
+                errors.push(`${name} must be an integer between ${min} and ${max} (got ${JSON.stringify(value)})`);
+                return false;
+            }
+            return true;
+        };
+
+        /* ---- dj.config ---- */
+
+        requireText(cfg.data_root, 'data_root');
+        requireText(cfg.access_file, 'access_file');
+
+        if (requireText(cfg.jwt_secret, 'jwt_secret') && cfg.jwt_secret.length < 32) {
+            warnings.push(`jwt_secret is only ${cfg.jwt_secret.length} characters; use a long random value (32+)`);
+        }
+
+        if (cfg.ssl?.enabled) {
+            requireInt(cfg.ssl.port, 'ssl.port', { min: 1, max: 65535 });
+            for (const field of ['key', 'cert']) {
+                if (requireText(cfg.ssl[field], `ssl.${field}`) && !fs.existsSync(cfg.ssl[field])) {
+                    errors.push(`ssl.${field} points to a file that does not exist: ${cfg.ssl[field]}`);
+                }
+            }
+        } else {
+            requireInt(cfg.port, 'port', { min: 1, max: 65535 });
+        }
+
+        // A sha256 hex digest is 64 characters and getKeyPath() consumes two per
+        // level, so more than 32 levels cannot be built from it.
+        requireInt(cfg.index_depth, 'index_depth', { min: 1, max: 32 });
+
+        // Byte sizes are handed straight to body-parser, which parses them with the
+        // `bytes` package. That package is only a transitive dependency here, so it
+        // must not be required directly just to validate; the shape is checked with
+        // a pattern instead.
+        const checkByteSize = (value, name) => {
+            if (value === undefined) return;
+            if (typeof value === 'number') {
+                if (!(value > 0)) {
+                    errors.push(`${name} must be a positive number of bytes (got ${JSON.stringify(value)})`);
+                }
+                return;
+            }
+            if (typeof value !== 'string' || !/^\s*\d+(\.\d+)?\s*(b|kb|mb|gb|tb|pb)?\s*$/i.test(value)) {
+                errors.push(`${name} must be a byte count or a size string like "10mb" / "512kb" (got ${JSON.stringify(value)})`);
+            }
+        };
+        checkByteSize(cfg.payload_limit, 'payload_limit');
+        checkByteSize(cfg.text_payload_limit, 'text_payload_limit');
+
+        if (cfg.script_engine !== undefined && !AVAILABLE_ENGINES.includes(cfg.script_engine)) {
+            errors.push(
+                `script_engine "${cfg.script_engine}" is unknown. Valid options: ` +
+                `${AVAILABLE_ENGINES.map(e => `"${e}"`).join(', ')} (omit the key to use "${DEFAULT_ENGINE}")`
+            );
+        }
+
+        if (cfg.script_execution_time_limit !== undefined
+            && !(Number(cfg.script_execution_time_limit) > 0)) {
+            errors.push(`script_execution_time_limit must be a positive number of milliseconds (got ${JSON.stringify(cfg.script_execution_time_limit)})`);
+        }
+
+        if (cfg.index_archiving !== undefined) {
+            if (!isPlainObject(cfg.index_archiving)) {
+                errors.push('index_archiving must be an object with older_than_days and/or archiving_url');
+            } else {
+                const { older_than_days, archiving_url } = cfg.index_archiving;
+                if (older_than_days !== undefined && !(Number(older_than_days) > 0)) {
+                    errors.push(`index_archiving.older_than_days must be a positive number of days (got ${JSON.stringify(older_than_days)})`);
+                }
+                if (older_than_days === undefined && !archiving_url) {
+                    warnings.push('index_archiving is set but has no older_than_days, so no archive snapshots will ever be deleted');
+                }
+                if (archiving_url !== undefined && archiving_url !== null && typeof archiving_url !== 'string') {
+                    errors.push('index_archiving.archiving_url must be a string or null');
+                }
+                if (archiving_url) {
+                    warnings.push('index_archiving.archiving_url is set but not implemented yet; only older_than_days is applied');
+                }
+            }
+        }
+
+        /* ---- access.json ---- */
+
+        if (!isPlainObject(access.users)) {
+            errors.push('access_file: "users" is missing or not an object');
+        } else if (Object.keys(access.users).length === 0) {
+            warnings.push('access_file: "users" is empty, nobody can log in');
+        }
+
+        if (!isPlainObject(access.groups)) {
+            errors.push('access_file: "groups" is missing or not an object');
+        }
+
+        if (isPlainObject(access.users) && isPlainObject(access.groups)) {
+            for (const [userId, user] of Object.entries(access.users)) {
+                if (!Array.isArray(user?.groups)) {
+                    errors.push(`access_file: user "${userId}" has no "groups" array`);
+                    continue;
+                }
+                for (const group of user.groups) {
+                    // checkPermissions() reads groups[group].rules directly, so an
+                    // unknown group name is a TypeError on the next request.
+                    if (!(group in access.groups)) {
+                        errors.push(`access_file: user "${userId}" references unknown group "${group}"`);
+                    }
+                }
+                if (user.password === undefined) {
+                    errors.push(`access_file: user "${userId}" has no password`);
+                } else if (typeof user.password === 'string' && !user.password.startsWith('scrypt:')) {
+                    errors.push(`access_file: user "${userId}" has a password that is not a scrypt hash; run hashPassword() and store the result`);
+                }
+            }
+        }
+
+        if (isPlainObject(access.groups)) {
+            for (const [groupName, group] of Object.entries(access.groups)) {
+                if (!Array.isArray(group?.rules)) {
+                    warnings.push(`access_file: group "${groupName}" has no "rules" array, it grants nothing`);
+                } else {
+                    group.rules.forEach((rule, i) => {
+                        const where = `access_file: group "${groupName}" rule #${i + 1}`;
+                        try {
+                            new RegExp(rule?.regex);
+                        } catch (err) {
+                            errors.push(`${where} has an invalid regex: ${err.message}`);
+                        }
+                        if (rule?.crudx !== undefined && !/^[01]{5}$/.test(rule.crudx)) {
+                            errors.push(`${where} has crudx "${rule.crudx}", expected 5 characters of 0/1`);
+                        } else if (rule?.crudx === undefined && rule?.crud !== undefined && !/^[01]{4}$/.test(rule.crud)) {
+                            errors.push(`${where} has crud "${rule.crud}", expected 4 characters of 0/1`);
+                        } else if (rule?.crudx === undefined && rule?.crud === undefined) {
+                            errors.push(`${where} has neither "crudx" nor "crud"`);
+                        }
+                    });
+                }
+
+                if (group?.allowed_origins !== undefined) {
+                    if (!Array.isArray(group.allowed_origins)) {
+                        errors.push(`access_file: group "${groupName}" has an "allowed_origins" that is not an array`);
+                    } else {
+                        group.allowed_origins.forEach((origin, i) => {
+                            // The silent killer: a bare JSON null (or any non-string)
+                            // still counts toward the whitelist size, so the
+                            // open-by-default fallback stays off while the entry can
+                            // never match. See isOriginAllowed() for the "null" case.
+                            if (typeof origin !== 'string' || origin.trim() === '') {
+                                errors.push(
+                                    `access_file: group "${groupName}" allowed_origins[${i}] is ${JSON.stringify(origin)}; ` +
+                                    'entries must be non-empty strings (to allow a file:// page use the quoted string "null")'
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        warnings.forEach(w => console.warn(`Config warning: ${w}`));
+
+        if (errors.length) {
+            throw new Error(
+                `Invalid configuration (${errors.length} problem${errors.length > 1 ? 's' : ''}):\n` +
+                errors.map(e => `  - ${e}`).join('\n')
+            );
+        }
     }
 
     async createDirectories() {
@@ -88,6 +331,10 @@ class DeepJSONServer {
     setupServer() {
         this.app = express();
 
+        // Express advertises itself with X-Powered-By on every response. It tells a
+        // client nothing useful and tells a scanner which stack to target, so it goes.
+        this.app.disable('x-powered-by');
+
         // Core middleware
         this.app.use(express.json({ limit: this.config.payload_limit || '10mb' }));
         this.app.use(fileUpload({
@@ -96,13 +343,39 @@ class DeepJSONServer {
         }));
 
 
-        // key requests could be text
-        this.app.use('/keys/:key', express.text({ type: 'text/*' }));
+        // key requests could be text.
+        //
+        // The limit has to be passed explicitly: without it express.text() falls
+        // back to body-parser's built-in 100kb default, which is far below
+        // payload_limit and silently caps the main key-write path (writing a key
+        // as text/* is the working route, so this limit is the one users hit).
+        // Precedence: text_payload_limit, then payload_limit, then 10mb.
+        this.app.use('/keys/:key', express.text({
+            type: 'text/*',
+            limit: this.getTextPayloadLimit()
+        }));
 
         // exposedHeaders: X-Renewed-Token carries the sliding-session token
         // (see authMiddleware()) - without this, browser-based clients can't
         // read it, even though the header is present in the raw response.
-        this.app.use(cors({ exposedHeaders: ['X-Renewed-Token'] }));
+        //
+        // origin: per-group allowlist (see getAllowedCorsOrigins()) for cases like
+        // an <img>/fetch pointing straight at a resized image's URL from another
+        // domain, outside the normal API-client flow. CORS itself can't be scoped
+        // to "this group only" - the browser's preflight carries no auth, so the
+        // server can't yet know which user/group is asking. What this actually
+        // enforces is the union of every group's allowed_origins, as one global
+        // whitelist; group membership only organizes which origin belongs to
+        // which client app in access.json, it isn't checked per request here.
+        // Backward-compatible default: if no group defines allowed_origins at all,
+        // every origin is still allowed, same as before this change.
+        this.app.use(cors({
+            origin: (origin, callback) => {
+                if (this.isOriginAllowed(origin)) return callback(null, true);
+                callback(new Error(`Origin not allowed by CORS: ${origin}`));
+            },
+            exposedHeaders: ['X-Renewed-Token']
+        }));
         this.app.use((req, res, next) => {
             if (req.secure) {
                 res.setHeader('Strict-Transport-Security', 'max-age=31536000');
@@ -129,6 +402,11 @@ class DeepJSONServer {
             if (res.locals.fileUpload) res.locals.binaryRequest = false;
             next();
         });
+
+        // Identity and build info. Both sit behind authMiddleware, so they double as
+        // a login check, and each response carries a fresh X-Renewed-Token.
+        this.app.get('/version', this.handleVersion.bind(this));
+        this.app.get('/whoami', this.handleWhoami.bind(this));
 
         // Core routes
         this.app.route('/keys/:key')
@@ -180,8 +458,22 @@ class DeepJSONServer {
      */
     _setupSocketServer(expressServer) {
         this.io = new Server(expressServer, {
+            // socket.io keeps its own CORS config, separate from the Express
+            // middleware above - restricting one does not restrict the other.
+            //
+            // This covers BOTH transports: unlike a raw browser WebSocket, where
+            // CORS is never enforced, engine.io runs this check itself on the
+            // handshake, so a client using transports: ['websocket'] to skip
+            // polling is rejected here too (verified against both transports).
+            //
+            // No exposedHeaders here on purpose: the handshake authenticates once
+            // via the query-parameter token and never renews it, so there is no
+            // X-Renewed-Token to hand back (see authMiddleware()).
             cors: {
-                origin: '*',
+                origin: (origin, callback) => {
+                    if (this.isOriginAllowed(origin)) return callback(null, true);
+                    callback(new Error(`Origin not allowed by CORS: ${origin}`));
+                },
                 methods: ["GET", "POST"],
                 allowedHeaders: ["Authorization", "Content-Type"],
                 credentials: false
@@ -538,6 +830,51 @@ class DeepJSONServer {
         return allowed;
     }
 
+    /**
+     * Union of every group's `allowed_origins` (access.json), forming the CORS
+     * whitelist used in setupServer(). Optional per group, mirrors how
+     * device.allowed_ips works for HMAC devices: a group with no allowed_origins
+     * simply contributes nothing. Enforcement itself is global, not per-group -
+     * see the comment above the cors() call for why it can't be scoped tighter.
+     */
+    getAllowedCorsOrigins() {
+        const origins = new Set();
+        for (const group of Object.values(this.accessData.groups || {})) {
+            (group.allowed_origins || []).forEach(origin => origins.add(origin));
+        }
+        return origins;
+    }
+
+    /**
+     * Whether a request carrying this Origin header may talk to the server at all.
+     * Shared by the Express CORS middleware and socket.io's CORS block, so the two
+     * can't drift apart.
+     *
+     * Two deliberate pass-throughs:
+     * - empty whitelist: no group has opted in yet, so everything stays allowed,
+     *   exactly as it behaved before allowed_origins existed.
+     * - no Origin header: not a browser (curl, server-to-server, native client).
+     *   Such clients ignore CORS anyway, so refusing them here would buy nothing
+     *   while breaking legitimate integrations. Real protection is the JWT check.
+     *
+     * Careful with "null" - it is NOT one of those pass-throughs. A browser sends
+     * the literal header `Origin: null` for a page opened straight off disk
+     * (file://), for sandboxed iframes and for some redirect chains, and it arrives
+     * here as the four-character string "null", not as a missing origin. It is
+     * therefore matched against the whitelist like any other origin, on purpose:
+     * "null" identifies no one, so any sandboxed iframe on any site could claim it.
+     *
+     * If a setup really has to allow it (local development against a file:// page),
+     * allowed_origins needs the QUOTED string "null". A bare JSON null literal
+     * silently matches nothing: it still counts toward the whitelist size, so the
+     * open-by-default fallback does not kick in either, and every browser request
+     * is refused with no hint as to why.
+     */
+    isOriginAllowed(origin) {
+        const allowed = this.getAllowedCorsOrigins();
+        return allowed.size === 0 || !origin || allowed.has(origin);
+    }
+
     checkAdmin(user) {
         if (!user || !user.id) return false;
 
@@ -585,13 +922,71 @@ class DeepJSONServer {
                 http_method: req.method,
                 key: data ? data._key : undefined,
                 hash: data ? data._hash : undefined,
-                response: null
+                // Deliberately NOT seeded with null. The caller distinguishes
+                // "the script never assigned response" from "the script set it to
+                // null", and only undefined can carry the first meaning: an
+                // untouched response stays undefined and JSON.stringify drops it
+                // from the payload entirely, while an explicit null survives as
+                // null. Seeding it with null made the two indistinguishable.
+                response: undefined
             })
         };
         return null;
     }
 
+    /**
+     * Runs `fn` with exclusive access to one key, queueing behind anything already
+     * running for that same key. Different keys never wait on each other.
+     *
+     * Needed because a write is not one operation but three: read the document,
+     * run the script, write the result. Without serialization two requests both
+     * read the same starting state and the second silently discards the first
+     * one's result. Measured before this existed: three workers doing 40 writes
+     * each on one key, 8 acknowledged as successful, none of them surviving.
+     *
+     * Scope and limits: this is an in-process queue, so it holds for one server
+     * instance. Running several instances against the same data_root would need
+     * real file locking instead. A rejected operation must not break the chain for
+     * everyone queued behind it, hence the settle-either-way handling below.
+     */
+    async withKeyLock(key, fn) {
+        const previous = this._keyLocks.get(key) || Promise.resolve();
+
+        // Start only once the previous holder has settled, successfully or not.
+        const run = previous.then(() => fn(), () => fn());
+        // The queue tail must never reject, or the next waiter inherits the failure.
+        const tail = run.then(() => { }, () => { });
+        this._keyLocks.set(key, tail);
+
+        try {
+            return await run;
+        } finally {
+            // Drop the entry when nobody queued up behind us, so the map does not
+            // grow by one permanent entry for every key ever written.
+            if (this._keyLocks.get(key) === tail) this._keyLocks.delete(key);
+        }
+    }
+
+    /**
+     * Serializes anything that can modify a key, then hands off to the real handler.
+     *
+     * Reads deliberately skip the queue: writeKeyData() renames atomically, so a
+     * reader always sees one complete document, and making reads wait would stall
+     * them behind writes on exactly the hot keys that need throughput most.
+     *
+     * The effective method is what counts, since X-Method-Override rewrites it
+     * further down: a POST flagged as GET is a read and must not take the lock,
+     * while the reverse does modify and must.
+     */
     async handleKeyRequest(req, res) {
+        const effectiveMethod = (res.locals?.overwriteMethod || req.method || '').toUpperCase();
+        const modifies = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(effectiveMethod);
+
+        if (!modifies) return this._handleKeyRequest(req, res);
+        return this.withKeyLock(req.params.key, () => this._handleKeyRequest(req, res));
+    }
+
+    async _handleKeyRequest(req, res) {
         try {
             let key = req.params.key;
             let generatedKey = undefined;
@@ -660,8 +1055,14 @@ class DeepJSONServer {
                 // add the options to the response
                 response.options = {};
 
+                // These three checks ask "was it assigned", never "is it truthy".
+                // Testing truthiness rejected scripts that legitimately produced 0,
+                // false or an empty string, and on a write it treated an explicit
+                // null as "unset" and sent the entire stored document back instead.
+                // See processScriptBody(): response is left undefined precisely so
+                // that undefined can mean "never assigned" here.
                 if (req.modifiable_method) {
-                    if (!response.data) {
+                    if (response.data === undefined) {
                         // a modifiable call needs to set the "data" variable in the script!
                         response.options.status = 400;
                         response.options.error = { error: 'script is a modifiable call, but misses to set the "data" value inside the script!' };
@@ -670,14 +1071,14 @@ class DeepJSONServer {
                         response.options.status = 200;
                         response.options.content = "json";
                         response.data = { ...data, value: response.data, custom: response.custom };
-                        // if the response is not set, then put the data into the response values
-                        if (!response.response) {
+                        // if the response was never assigned, fall back to the stored value
+                        if (response.response === undefined) {
                             response.response = response.data.value;
                         }
                     }
                 } else if (!req.modifiable_method) {
-                    // if the response.response is set, use that, otherwise use the original data
-                    if (response.response) {
+                    // if the response.response was assigned, use it, whatever its value
+                    if (response.response !== undefined) {
                         // do nothing :)
                         response.options.status = 200;
                         response.options.content = "json";
@@ -1064,6 +1465,72 @@ class DeepJSONServer {
     }
 
     /**
+     * GET /version - deliberately tiny, so a client can use it as a frequent
+     * heartbeat. Behind authMiddleware, so it answers three questions at once:
+     * is the server up, is my token still valid, and what am I talking to.
+     * The renewed token rides along in X-Renewed-Token like on any other request.
+     */
+    handleVersion(req, res) {
+        res.json({ version: this.getServerVersion() });
+    }
+
+    /**
+     * GET /whoami - who the caller is and what they may do.
+     * Optional: ?keys=a,b,c resolves the effective permissions for those keys.
+     *
+     * About `rules`: these are returned for display and debugging only, never as
+     * something a client should evaluate itself. checkPermissions() walks every
+     * group and every rule in order and the LAST match wins, so a later rule with
+     * a 0 revokes what an earlier one granted, and the same rules in a different
+     * order produce a different answer. A client reimplementing the usual "any
+     * matching rule grants it" would disagree with the server exactly where it
+     * matters. Anything load-bearing goes through `permissions` below, which is
+     * computed by the same checkPermissions() that enforces on every request.
+     */
+    handleWhoami(req, res) {
+        const userEntry = this.accessData.users[req.user.id] || {};
+        const groups = userEntry.groups || [];
+
+        // Flattened in evaluation order, with the owning group attached, so the
+        // listing mirrors what the server actually walks through.
+        const rules = [];
+        for (const groupName of groups) {
+            const group = this.accessData.groups[groupName];
+            for (const rule of (group?.rules || [])) {
+                rules.push({ group: groupName, regex: rule.regex, crudx: rule.crudx ?? rule.crud });
+            }
+        }
+
+        const payload = {
+            version: this.getServerVersion(),
+            authenticated: true,
+            // Built field by field on purpose: the stored record also holds the
+            // password hash, and spreading it would hand that to the client.
+            user: { id: userEntry.id, email: userEntry.email },
+            groups,
+            isAdmin: this.checkAdmin(req.user),
+            rules,
+            rulesAreAdvisory: true
+        };
+
+        const requested = (req.query.keys || '').split(',').map(k => k.trim()).filter(Boolean);
+        if (requested.length) {
+            payload.permissions = {};
+            for (const key of requested) {
+                payload.permissions[key] = {
+                    C: this.checkPermissions(req.user, key, 'C'),
+                    R: this.checkPermissions(req.user, key, 'R'),
+                    U: this.checkPermissions(req.user, key, 'U'),
+                    D: this.checkPermissions(req.user, key, 'D'),
+                    X: this.checkPermissions(req.user, key, 'X')
+                };
+            }
+        }
+
+        res.json(payload);
+    }
+
+    /**
      * admin functions
      */
     handleAdminKeys(req, res) {
@@ -1333,7 +1800,30 @@ class DeepJSONServer {
                 Object.assign(data, upload);
             }
 
-            await fsp.writeFile(filePath, JSON.stringify(data));
+            // Write to a temp file, then rename over the target. rename(2) is atomic
+            // on POSIX, so a concurrent reader always sees either the whole previous
+            // document or the whole new one, never a half-written file.
+            //
+            // fsp.writeFile() on its own truncates the target and writes into it,
+            // which had two failure modes under concurrency: a reader could catch
+            // the file mid-write and fail to parse it, and a shorter write landing
+            // on a longer one left the tail of the old content behind, corrupting
+            // the document permanently.
+            //
+            // The temp file has to live in the same directory, so that the rename
+            // stays within one filesystem and remains atomic instead of degrading
+            // into a copy. The random suffix keeps two concurrent writers from
+            // colliding on the temp file itself.
+            const payload = JSON.stringify(data);
+            const tmpPath = path.join(dir, `.${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+            try {
+                await fsp.writeFile(tmpPath, payload);
+                await fsp.rename(tmpPath, filePath);
+            } catch (writeError) {
+                // Never leave a stray temp file behind if the write or rename failed.
+                await fsp.unlink(tmpPath).catch(() => {});
+                throw writeError;
+            }
 
             // Update index
             await this.updateIndex(req, key, 'WRITE');
