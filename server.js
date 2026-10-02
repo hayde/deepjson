@@ -11,6 +11,7 @@ const http = require('http');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const fileUpload = require('express-fileupload');
+const bytes = require('bytes');
 const sharp = require('sharp');
 const { Server } = require('socket.io');
 const contentDisposition = require('content-disposition');
@@ -147,6 +148,36 @@ class DeepJSONServer {
             this._textParsers.set(limit, parser);
         }
         return parser;
+    }
+
+    /**
+     * express-fileupload instance for one limit value, cached, mirroring
+     * _textParserFor().
+     *
+     * A file upload is a key write with a multipart body - processFileUpload() is
+     * reached only from _handleKeyRequest() - so the same key_payload_limits entry
+     * that governs a text write governs the file too, and an operator who sets
+     * "350mb" for a key gets it on both paths instead of hitting a hidden floor.
+     *
+     * fileSize wants a byte count where body-parser accepts the size string
+     * directly, hence the bytes.parse(). A limit that somehow fails to parse falls
+     * back to 50MB rather than to no limit at all, because unlimited here means one
+     * request can exhaust the heap: express-fileupload buffers the whole file, and
+     * processFileUpload() then holds a base64 copy of it as well.
+     */
+    _fileUploadFor(limit) {
+        if (!this._fileUploaders) this._fileUploaders = new Map();
+        let uploader = this._fileUploaders.get(limit);
+        if (!uploader) {
+            const fileSize = (typeof limit === 'number' ? limit : bytes.parse(limit))
+                || 50 * 1024 * 1024;
+            uploader = fileUpload({
+                limits: { fileSize },
+                abortOnLimit: true
+            });
+            this._fileUploaders.set(limit, uploader);
+        }
+        return uploader;
     }
 
     loadConfig() {
@@ -444,11 +475,6 @@ class DeepJSONServer {
 
         // Core middleware
         this.app.use(express.json({ limit: this.config.payload_limit || '10mb' }));
-        this.app.use(fileUpload({
-            limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
-            abortOnLimit: true
-        }));
-
 
         // key requests could be text.
         //
@@ -463,6 +489,19 @@ class DeepJSONServer {
         this.app.use('/keys/:key', (req, res, next) => {
             const limit = this.getPayloadLimitForKey(req.params.key);
             return this._textParserFor(limit)(req, res, next);
+        });
+
+        // Same resolution for multipart file uploads, which used to run through a
+        // globally mounted express-fileupload pinned to 50MB. It was mounted before
+        // any route matched, so req.params.key did not exist yet and the limit could
+        // not depend on the key - which made key_payload_limits look like it covered
+        // uploads while it silently did not. Scoping it here is safe: req.files is
+        // read only by processFileUpload(), which no route outside /keys/:key
+        // reaches. express.text() above ignores multipart bodies, so the two
+        // parsers do not collide.
+        this.app.use('/keys/:key', (req, res, next) => {
+            const limit = this.getPayloadLimitForKey(req.params.key);
+            return this._fileUploadFor(limit)(req, res, next);
         });
 
         // exposedHeaders: X-Renewed-Token carries the sliding-session token
@@ -1007,7 +1046,7 @@ class DeepJSONServer {
         const engine = getScriptEngine(this.config.script_engine);
         const limits = {
             timeoutMs: parseInt(this.config.script_execution_time_limit) || 5000,
-            memoryLimitBytes: 50 * 1024 * 1024 // 50MB
+            memoryLimitBytes: 350 * 1024 * 1024 // 350MB
         };
 
         try {

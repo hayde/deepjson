@@ -159,6 +159,62 @@ never evaluated anywhere. The field implies an expiry date that does not exist.
 
 ---
 
+### 5b. A scripted write copies the whole document into the sandbox, used or not
+
+`processScriptBody()` ([server.js:1023](server.js#L1023)) hands every script the
+same four values — `origin`, `data`, `custom` and `body` — regardless of which ones
+the script actually reads. The sandbox heap is hardcoded to 50 MB
+([server.js:1010](server.js#L1010)), the same genre of problem as entry 9: the
+script *timeout* reads `script_execution_time_limit` from the config, the memory
+limit is not configurable at all.
+
+Together those two produce a hard failure on writes that need almost no memory.
+Hit in production on 2026-10-01 at 15:03:26 and 15:06:39 UTC, twice:
+
+```json
+{"method":"PUT","path":"/keys/de.zeitgeist.wiesbaden.scanner.bundle.93bdc9b8…",
+ "user":"whatsapp","status":500,"error":"Script failed: \"out of memory\""}
+```
+
+The script behind it is three lines and reads `data` only as a no-op
+self-assignment:
+
+```js
+if (!custom) custom = {};
+custom.scanner = body;
+data = data;
+```
+
+`body` there is four fields of scanner metadata, a few hundred bytes. The document
+under that key already held an uploaded PDF, written by a preceding `uploadFile()`
+on the same key, so the injected `data` was tens of megabytes and exhausted the
+heap on its own. The error names the script, which sends anyone debugging it to the
+one place where nothing is wrong.
+
+The fix is to inject conditionally: pass a value only when the script references
+it. The check has to be conservative — if it cannot be shown that the script never
+touches `data`, inject it — which is trivially decidable for scripts like the ones
+in use, where these are plain identifier references. Scripts that genuinely do read
+the document keep working unchanged; the two clearest examples are the client's
+`RESERVE_DOCIDS_SCRIPT` and `UPSERT_SCRIPT`, which both mutate `data` directly.
+
+Worth doing alongside it, but not instead of it:
+
+1. **Make the memory limit configurable**, `script_memory_limit` next to the
+   existing byte-size options, validated with `checkByteSize()`
+   ([server.js:243](server.js#L243)).
+2. **Warn at startup when it is not clearly larger than the effective payload
+   limit.** Both sit at 50 MB today, which guarantees this failure: the sandbox has
+   to hold the body plus the script's own working copies, so any payload near the
+   cap cannot fit. Equal values should never pass validation silently.
+
+Raising the heap is not the long-term answer by itself. Documents are serialized as
+a single string and V8 refuses strings over 512 MB — the condition already warned
+about at startup — so "hand the whole document to the script" stops being viable
+for large files whatever the limit says.
+
+---
+
 ## Hardening
 
 ### 6. Startup validation should flag unknown config keys
@@ -186,10 +242,43 @@ There is no Express error middleware. As a result a rejected CORS origin returns
 `500` instead of `403`, and an oversized body returns an HTML error page with a
 stack trace instead of JSON, which clients expecting JSON then fail to parse.
 
-### 9. The file upload limit is hardcoded
+### 9. The file upload limit was hardcoded, and `key_payload_limits` silently did not cover it — FIXED
 
-50 MB in `express-fileupload` ([server.js:314](server.js#L314)). `payload_limit` and
-`text_payload_limit` are configurable, this one is not.
+Fixed by resolving the upload limit per key, the same way text writes already did.
+`_fileUploadFor()` caches one `express-fileupload` instance per distinct limit
+value, mirroring `_textParserFor()`, and both are now mounted on `/keys/:key` so
+`req.params.key` is available. One `key_payload_limits` entry governs both paths.
+
+The original analysis is kept below, because the misleading part is worth
+remembering.
+
+---
+
+`express-fileupload` was mounted globally with `limits: { fileSize: 50 * 1024 * 1024 }`.
+Being mounted before any route matched, it could not see `req.params.key`, so the
+limit could not depend on the key.
+
+The damaging part was not that it was hardcoded but that it was **invisible**.
+`key_payload_limits` reads as though it governs everything written under a key, and
+for text writes it does. A file upload is also a key write — `processFileUpload()`
+is reached only from `_handleKeyRequest()` on `/keys/:key` — so an operator who set
+`"350mb"` for a key reasonably expected uploads to obey it. They did not, and
+nothing in `dj.config` hinted at a 50 MB floor underneath.
+
+Cost in practice, on 2026-10-02: a 66 MB scanner PDF was chased through four
+limits one at a time — nginx `client_max_body_size`, then this one, then the script
+sandbox — with the configuration appearing to permit 350 MB throughout. The 413 it
+produced also reached the browser as an unparseable HTML error page, because the
+upload page calls `JSON.parse()` without checking `response.ok` first.
+
+Two ceilings remain, and no configured number lifts them:
+
+1. `express-fileupload` buffers the whole file, and `processFileUpload()` then holds
+   a base64 copy, so one upload costs roughly 2.3x the file size in memory.
+   Concurrent large uploads multiply that.
+2. base64 expands by 4/3 and V8 refuses strings over 512 MB, so `.toString('base64')`
+   throws somewhere above **384 MB of raw file** whatever the limit says. Past that,
+   streaming is the only answer — the same wall as document serialization.
 
 ---
 
