@@ -1,0 +1,7 @@
+{
+  "data_root": "/var/lib/deepjson",
+  "access_file": "/etc/deepjson/access.json",
+  "port": 3000,
+  "jwt_secret": "REPLACE_ME_WITH_64_RANDOM_HEX_CHARACTERS",
+  "index_depth": 3
+}
