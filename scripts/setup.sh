@@ -1,5 +1,5 @@
 #!/bin/bash
-# deepjson-server-setup.sh
+# scripts/setup.sh
 
 # Configuration
 CONFIG_DIR="/etc/deepjson"
