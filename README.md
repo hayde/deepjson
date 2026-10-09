@@ -1,12 +1,14 @@
 # DeepJSON
 
-A JSON document database with built-in server-side scripting, real-time synchronization, and binary file storage. One server replaces what typically takes a database, a file store, a scripting layer and a WebSocket service.
+A JSON document database with built-in server-side scripting, real-time synchronization and binary file storage. One server replaces what typically takes a database, a file store, a scripting layer and a WebSocket service.
 
 ## Why DeepJSON
 
-Most JSON databases only store data. Everything else like scripting, file handling, real-time sync, access control must be handled seperatly. DeepJSON handles all of it in a single process with a single config file.
+Most databases only store data. Everything else like scripting, file handling, real-time sync and access control must be handled separately. DeepJSON handles all of it in a single process with two config files.
 
 Most startups start with a database and quickly add an object store for files, an auth service and a cache or real-time layer. DeepJSON is a single process that covers all of them.
+
+Security is handled natively. Authentication, permissions, token renewal and password hashing are all built into the server. With separate services, developers spend time wiring up auth layers, managing API keys between services and securing inter-service communication. With DeepJSON, security works out of the box and developers can focus on building features.
 
 - **Server-side scripting**: send JavaScript alongside your request, executed in a sandboxed WebAssembly environment (QuickJS). No Lambda functions, no separate compute layer. The script runs against your data and returns the result in one round trip.
 - **Real-time sync**: built-in WebSocket channels with master/client sessions. No need for a separate pub/sub service.
@@ -23,8 +25,8 @@ DeepJSON works well as:
 - A **prototyping and rapid development database**: one server, one config file, full CRUD + scripting + sync out of the box
 - A **startup backend** that replaces your database, file store, scripting layer and WebSocket service with a single process. Fewer moving parts, lower infra cost, faster time to market
 - An **IoT data store** with HMAC device authentication and IP whitelisting
-- A **collaborative application backend** with real-time channels for live editing, dashboards, or multiplayer features
-- A **self-hosted alternative** to Firebase, Supabase, or MongoDB Atlas when you want full control over your data and infrastructure
+- A **collaborative application backend** with real-time channels for live editing, dashboards or multiplayer features
+- A **self-hosted alternative** to Firebase, Supabase or MongoDB Atlas when you want full control over your data and infrastructure
 - A **document and file management backend** with content-addressable storage and on-the-fly image processing
 
 ## Quick Start
@@ -280,7 +282,7 @@ await dj.post('logs.*{type:random}', { event: 'user_signup' });
 await dj.move('drafts.article-1', 'published.article-1');
 ```
 
-The move operation verifies delete permission on the source, create/update permission on the target, supports wildcard destinations, and records the move in the key's metadata history.
+The move operation verifies delete permission on the source, create/update permission on the target, supports wildcard destinations and records the move in the key's metadata history.
 
 ### Index System
 
@@ -311,7 +313,7 @@ Both sit behind authentication, so they double as a connectivity check and token
 | Endpoint | Description |
 |----------|-------------|
 | `GET /version` | Server version (from package.json). Lightweight heartbeat. |
-| `GET /whoami` | Caller's identity, groups, admin status, and rule list |
+| `GET /whoami` | Caller's identity, groups, admin status and rule list |
 | `GET /whoami?keys=a,b` | Same, plus resolved CRUDX permissions for the requested keys |
 
 ## Configuration Reference
@@ -412,7 +414,7 @@ Tests use Node's built-in `node:test` runner. No test framework to install.
 
 - Passwords stored as scrypt hashes with constant-time comparison
 - JWT tokens with configurable expiry and automatic renewal
-- Server-side scripts sandboxed in WebAssembly (no filesystem, network, or Node.js API access)
+- Server-side scripts sandboxed in WebAssembly (no filesystem, network or Node.js API access)
 - HMAC device authentication with replay protection (timestamp window) and IP whitelisting
 - HSTS headers on HTTPS connections
 - `X-Powered-By` header disabled
@@ -422,7 +424,7 @@ Tests use Node's built-in `node:test` runner. No test framework to install.
 
 DeepJSON is designed for both horizontal and vertical scaling.
 
-**Horizontal scaling**: the server is stateless by design. Data lives on the filesystem, not in process memory, so you can run multiple DeepJSON instances behind a load balancer pointing at the same shared storage (NFS, EFS, GlusterFS, or any POSIX-compatible filesystem). Each instance reads the same `dj.config` and `access.json`, handles its own requests independently, and writes to the same content-addressable directory tree. Add more instances to handle more concurrent connections, the data layer doesn't need to know about it.
+**Horizontal scaling**: the server is stateless by design. Data lives on the filesystem, not in process memory, so you can run multiple DeepJSON instances behind a load balancer pointing at the same shared storage (NFS, EFS, GlusterFS or any POSIX-compatible filesystem). Each instance reads the same `dj.config` and `access.json`, handles its own requests independently and writes to the same content-addressable directory tree. Add more instances to handle more concurrent connections, the data layer doesn't need to know about it.
 
 **Vertical scaling**: the content-addressable storage distributes files across a configurable directory tree (controlled by `index_depth`). A depth of 3 creates up to 16 million leaf directories, avoiding filesystem bottlenecks even with millions of keys. The in-memory index provides O(1) key lookups regardless of dataset size, and the append-only index log minimizes write contention.
 
