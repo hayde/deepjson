@@ -427,20 +427,56 @@ Tests use Node's built-in `node:test` runner. No test framework to install.
 
 ## Scaling
 
-DeepJSON is designed for both horizontal and vertical scaling.
+**Vertical scaling**: the content-addressable storage distributes files across a configurable directory tree (controlled by `index_depth`). A depth of 3 creates up to 16 million leaf directories, avoiding filesystem bottlenecks even with millions of keys. The in-memory index provides O(1) key lookups regardless of dataset size. The index is fully resident, so size your memory against key count, and startup replays the index log — run `POST /admin/rotate-index` or set `index_archiving.rotate_every_hours` to keep that log compact.
 
-**Horizontal scaling**: the server is stateless by design. Data lives on the filesystem, not in process memory, so you can run multiple DeepJSON instances behind a load balancer pointing at the same shared storage (NFS, EFS, GlusterFS or any POSIX-compatible filesystem). Each instance reads the same `dj.config` and `access.json`, handles its own requests independently and writes to the same content-addressable directory tree. Add more instances to handle more concurrent connections, the data layer doesn't need to know about it.
+### Horizontal scaling: key-based sharding
 
-**Vertical scaling**: the content-addressable storage distributes files across a configurable directory tree (controlled by `index_depth`). A depth of 3 creates up to 16 million leaf directories, avoiding filesystem bottlenecks even with millions of keys. The in-memory index provides O(1) key lookups regardless of dataset size, and the append-only index log minimizes write contention.
+Supported today, and it needs no changes to the server — only proxy configuration.
 
-**Real-time channel scaling**: WebSocket sessions are managed per-instance in memory. For horizontal deployments with real-time features, sticky sessions (session affinity) at the load balancer ensure all participants in a channel connect to the same instance. This is the same pattern used by Socket.IO in clustered environments.
+nginx computes the SHA-256 of the key in Lua and routes each request to the instance that owns that key's hash range. Every instance has its own `data_root` and its own index, and is the sole reader and writer for its keys. Nothing is shared, so nothing needs coordinating: per-key write serialization, index consistency and index rotation are each already correct within a shard. Clients talk to one endpoint and need no awareness of the split.
+
+```
+                    ┌──────────────┐
+                    │  nginx + Lua │  sha256(key) → shard
+                    └──────┬───────┘
+                 ┌─────────┼─────────┐
+                 ▼         ▼         ▼
+            DeepJSON   DeepJSON   DeepJSON
+            data_root  data_root  data_root
+```
+
+Requirements:
+
+- **Map fixed hash buckets to instances**, not `hash % instance_count`. With buckets, adding an instance relocates one bucket's keys; with modulo, nearly the whole keyspace moves.
+- **Key listings are per-shard.** `GET /cmd/keys/` and `GET /admin/keys` return the keys of the instance that answered. Fan out client-side if you need a complete listing.
+- **`POST /cmd/move` is shard-local.** Its keys travel in the request body, so the proxy cannot route it by key. Moves whose source and target fall in different shards need a coordinator.
+- **`*{type:inc}` is per-shard.** The next sequence number is taken from the serving instance's index, so two shards can issue the same number. Use `*{type:random}`, or route one key family to a single shard. `*{type:random}` is unaffected.
+- **`/admin/modifications/:since`** counts per shard; poll each instance.
+
+### Horizontal scaling: shared storage (coming soon)
+
+Coming soon, and the next topology on the roadmap: several instances over one filesystem (NAS, NFS, EFS or any POSIX mount), with storage left unified so no resharding is ever needed.
+
+It works by not trusting the in-memory index rather than by synchronising it. Because storage is content-addressable, a key's path is computed from its name — reads already resolve straight from disk and never consult the index. A `stateless` mode therefore resolves key existence from the filesystem too, which is what makes several instances over one mount coherent, and demotes the index to a local cache.
+
+Two pieces are required and not yet implemented:
+
+- **`stateless` mode**, resolving existence from disk. Existence is established by attempting the read rather than by `stat()`, so NFS attribute caching cannot produce a false miss: close-to-open consistency covers `open()`, and the handler was going to read the document anyway.
+- **Optimistic concurrency on `_modCounter`**, the per-document counter that already exists and increments on every write. Without it two instances can read the same document, run their scripts and both write, losing one update — a disk-backed existence check prevents stale 404s but serializes nothing.
+
+Known limits of this topology: key listings stay index-backed and may be stale, `*{type:inc}` needs a counter key or a pinned instance, and index rotation is refused, since it would rewrite the log from one instance's non-authoritative view.
+
+### Real-time channels
+
+WebSocket sessions are held per instance in memory. Sticky sessions (session affinity) at the load balancer ensure every participant in a channel reaches the same instance — the pattern Socket.IO uses in clustered environments. This applies to both topologies above.
 
 | Scaling strategy | How |
 |-----------------|-----|
-| More users / higher throughput | Add instances behind a load balancer (horizontal) |
-| Larger datasets | Increase `index_depth` for deeper directory distribution |
+| More users / higher throughput | Shard by key at the proxy |
+| Larger datasets | Increase `index_depth`, or add shards |
 | Bigger files / more storage | Expand or mount larger volumes at `data_root` |
-| Real-time at scale | Sticky sessions per channel across instances |
+| Unified storage across instances | Shared storage with `stateless` mode (coming soon) |
+| Real-time at scale | Sticky sessions per channel |
 
 ## Comparison with Other Databases
 
@@ -459,7 +495,7 @@ DeepJSON is designed for both horizontal and vertical scaling.
 | Sliding token renewal | 🟢 Auto | 🟡 Managed | 🔴 | 🔴 | 🟡 Managed |
 | Permission model | CRUDX | Rules | RBAC | ACL | RLS |
 | Setup complexity | 1 config | Console | Standalone | Config | Multi-svc |
-| Horizontal scaling | Stateless | Managed | Sharding | Cluster | Managed |
+| Horizontal scaling | Sharded | Managed | Sharding | Cluster | Managed |
 
 ## License
 
