@@ -209,6 +209,24 @@ Example `access.json`:
 
 Rules are evaluated in order: the **last matching rule wins**. This allows patterns like "access everything, except this subset."
 
+Within one group that ordering is deliberate and safe to rely on. Across groups it is
+not: the groups are walked in the order the user lists them, so adding a group to a
+user can revoke access they already had, and swapping two entries changes the
+outcome. The server reports this at startup, naming the user, the count and an
+example:
+
+```
+Permission warning: user "m1x" is denied C on 2 keys, U on 2 keys, D on 2 keys,
+X on 2 keys by a group listed after the one that granted it. Example:
+"de.kreuzer.doc.1" - C granted by group "worker" rule "^de\..*", then denied by
+group "readonly" rule "^de\.kreuzer\..*".
+```
+
+The within-group idiom above is not reported, since it is intentional. For an
+authoritative answer on any key, use `GET /whoami?keys=a,b` — it resolves
+permissions through the same code that enforces them, which is why the rule list it
+returns is marked `rulesAreAdvisory`.
+
 ### Server-Side Scripting
 
 Send JavaScript code with any request. Scripts execute in a sandboxed QuickJS WebAssembly environment. No access to Node.js APIs, the filesystem or the network. Memory and execution time are capped.

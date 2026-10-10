@@ -55,7 +55,26 @@ derivable from it.
 
 A script that wants to write its own key name into the value cannot do so today.
 
-### 4. Permissions depend on the order rules happen to be listed in
+### 4. Permissions depend on the order rules happen to be listed in — MITIGATED
+
+The hazard is now reported at startup rather than being invisible.
+`findCrossGroupRevocations()` walks each user's rules in evaluation order against
+the keys that actually exist and reports every key whose permission is taken away
+by a group listed *after* the one that granted it, with the user, the counts per
+operation and a worked example. 10ms for 11691 keys.
+
+Only the cross-group case is reported. Within one group the ordering is a
+documented idiom - grant a prefix, deny a narrower one beneath it, as
+`examples/access.json.example` does - and flagging that too would make the warning
+noise. Across groups the order comes from an arbitrary JSON array, which is the
+part nobody expects. Checked against real keys rather than by comparing patterns,
+so there are no false positives. Covered by `test/permissionOrder.test.js`.
+
+The underlying behaviour is unchanged, and the entry stays open because of that.
+The original analysis follows.
+
+---
+
 
 `checkPermissions()` ([server.js:793](server.js#L793)) assigns rather than
 accumulates: `allowed = crudx[idx] === '1'`. It walks every group of the user and
