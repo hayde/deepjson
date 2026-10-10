@@ -29,7 +29,8 @@ function baseContext() {
         http_method: undefined,
         key: undefined,
         hash: undefined,
-        response: null
+        response: null,
+        abort: undefined
     };
 }
 
