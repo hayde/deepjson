@@ -376,8 +376,106 @@ class DeepJSONServer {
         this.validateConfig();
         await this.createDirectories();
         await this.loadIndex();
+        // After loadIndex(), deliberately: this one reports against the keys that
+        // actually exist, which validateConfig() cannot see because it runs first.
+        this.warnAboutCrossGroupRevocations();
         this.setupServer();
         this.startIndexRotationSchedule();
+    }
+
+    /**
+     * Finds keys where one group grants a permission and another group, listed
+     * later on the same user, takes it away.
+     *
+     * checkPermissions() reassigns its verdict on every matching rule, so the LAST
+     * match decides - and it walks groups in the order `user.groups` happens to
+     * list them. Within one group that is a deliberate, documented idiom: grant a
+     * prefix, then deny a narrower one underneath it. Across groups it is a trap,
+     * because the order comes from an arbitrary JSON array, so adding a group to a
+     * user can silently revoke access they already had, and swapping two entries
+     * changes who can read what. Only the cross-group case is reported here;
+     * flagging the idiom as well would make the warning noise, and noise gets
+     * ignored.
+     *
+     * Checked against real keys rather than by comparing patterns, so there are no
+     * false positives: every key reported genuinely resolves that way today.
+     * Capped, because this walks keys x rules and an index can be large.
+     */
+    findCrossGroupRevocations({ limit = 50000 } = {}) {
+        const OPS = ['C', 'R', 'U', 'D', 'X'];
+        const findings = [];
+
+        for (const [userId, user] of Object.entries(this.accessData.users || {})) {
+            // Flattened in evaluation order, with the owning group attached, so the
+            // walk below mirrors exactly what checkPermissions() does.
+            const rules = [];
+            for (const groupName of (user.groups || [])) {
+                for (const rule of (this.accessData.groups?.[groupName]?.rules || [])) {
+                    // A rule carrying neither crudx nor crud never changes the
+                    // verdict, so it cannot revoke anything.
+                    const crudx = rule.crudx || (rule.crud !== undefined ? `${rule.crud}1` : undefined);
+                    if (!crudx) continue;
+                    try {
+                        rules.push({ group: groupName, regex: rule.regex, crudx, matcher: new RegExp(rule.regex) });
+                    } catch {
+                        // validateConfig() already rejects an uncompilable regex.
+                    }
+                }
+            }
+            if (rules.length < 2) continue;
+
+            const counts = new Map();
+            let example = null;
+            let scanned = 0;
+
+            for (const key of this.index.keys()) {
+                if (scanned >= limit) break;
+                scanned++;
+
+                const matched = rules.filter(r => r.matcher.test(key));
+                if (matched.length < 2) continue;
+
+                const decider = matched[matched.length - 1];
+
+                for (let i = 0; i < OPS.length; i++) {
+                    if (decider.crudx[i] === '1') continue;          // nothing taken away
+                    const grantor = matched.find(r => r.crudx[i] === '1' && r.group !== decider.group);
+                    if (!grantor) continue;                          // same group: the idiom
+
+                    counts.set(OPS[i], (counts.get(OPS[i]) || 0) + 1);
+                    if (!example) example = { key, operation: OPS[i], grantedBy: grantor, revokedBy: decider };
+                }
+            }
+
+            if (counts.size) {
+                findings.push({ userId, counts, example, scanned, sampled: scanned >= limit });
+            }
+        }
+
+        return findings;
+    }
+
+    warnAboutCrossGroupRevocations() {
+        const findings = this.findCrossGroupRevocations();
+
+        for (const finding of findings) {
+            const affected = [...finding.counts.entries()]
+                .map(([op, n]) => `${op} on ${n} key${n === 1 ? '' : 's'}`)
+                .join(', ');
+            const { key, operation, grantedBy, revokedBy } = finding.example;
+
+            console.warn(
+                `Permission warning: user "${finding.userId}" is denied ${affected} by a group listed ` +
+                `after the one that granted it. The last matching rule wins and groups are walked in the ` +
+                `order the user lists them, so adding or reordering a group can change this. ` +
+                `Example: "${key}" - ${operation} granted by group "${grantedBy.group}" rule ` +
+                `${JSON.stringify(grantedBy.regex)}, then denied by group "${revokedBy.group}" rule ` +
+                `${JSON.stringify(revokedBy.regex)}. GET /whoami?keys=... is the authoritative answer.` +
+                (finding.sampled ? ` (first ${finding.scanned} keys checked)` : '')
+            );
+        }
+
+        return findings;
     }
 
     /**
