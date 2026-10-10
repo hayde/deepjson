@@ -355,6 +355,65 @@ await dj.move('drafts.article-1', 'published.article-1');
 
 The move operation verifies delete permission on the source, create/update permission on the target, supports wildcard destinations and records the move in the key's metadata history.
 
+### Querying
+
+DeepJSON has no value-based query engine. There are two patterns instead, and
+between them they cover most access patterns without one — but it is worth knowing
+the limit before you design around it.
+
+**1. The key hierarchy is the index.** Keys are dotted paths, and the whole
+keyspace lives in memory, so a pattern over key *names* is answered without
+reading a single document:
+
+```javascript
+// every scanner bundle for one client site
+const { keys, total } = await dj.listKeys('^de\\.zeitgeist\\.wiesbaden\\.scanner\\.bundle\\.');
+
+// just the count, no keys transferred
+const { total } = await dj.listKeys('^de\\.zeitgeist\\.', { count: true });
+
+// one page at a time
+const page = await dj.listKeys('^de\\.', { limit: 100, offset: 200 });
+```
+
+| Option | Meaning |
+|--------|---------|
+| `keys` | Regular expression matched against the key name |
+| `limit`, `offset` | Page through the result. `total` always reports the full match |
+| `count` | Return only `total`, with no key list |
+
+So encode in the key what you will want to search by — client, site, type, date —
+and lookups stay index-only. `GET /cmd/keys/` and `GET /admin/keys` both work this
+way, and `key_list_limit` in `dj.config` lets an operator cap any single listing.
+
+**2. Model a collection as one document.** When a set of records is read and
+written together, store them under one key and query inside a script. The whole
+operation is one round trip, and it is serialized against other writers for free:
+
+```javascript
+// reserve a block of ids from a client record, server-side
+const result = await dj.put('clients', { kNumber: 'K-17', count: 20 }, `
+  var client = data.find(function (c) { return c.kNumber === body.kNumber; });
+  if (!client) { abort = { status: 404, error: 'unknown client' }; }
+  else {
+    var start = client.docIdCounter || 1;
+    client.docIdCounter = start + body.count;
+    response = { start: start, end: start + body.count - 1 };
+  }
+`);
+```
+
+Nothing but the request and `{ start, end }` crosses the network. This is the
+[core principle](#core-principle-compute-is-cheap-transport-is-not) applied to
+reads as much as writes.
+
+**What this does not do.** There is no index on document contents, so "every
+document where `status = 'pending'`" means reading every candidate document. A
+script cannot help: it receives its own document and nothing else, by design. If
+an access pattern needs selectivity on a field, the options today are to encode
+that field in the key, or to keep the collection in one document and search it
+inside a script.
+
 ### Conditional Requests
 
 Every response for a key carries an `ETag` — the document's version. Send it back
@@ -501,6 +560,7 @@ Both sit behind authentication, so they double as a connectivity check and token
 | `port` | number | HTTP listening port |
 | `jwt_secret` | string | Secret for signing JWTs |
 | `payload_limit` | string | Max request body size (e.g. `"50mb"`) |
+| `key_list_limit` | number | Maximum keys returned by a single listing. Omit for unlimited |
 | `durability` | string | `"sync"` (default) flushes each write to disk before acknowledging it; `"async"` acknowledges first and lets the OS flush. See [Durability](#durability) |
 | `index_depth` | number | Directory tree depth for content-addressable storage |
 | `script_engine` | string | Script sandbox engine (`"wasm"`, default) |

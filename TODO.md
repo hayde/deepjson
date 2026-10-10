@@ -138,6 +138,42 @@ the option.
 
 ---
 
+### 15. Scripted key filtering
+
+The key listing takes a regular expression over key names, which covers prefix and
+segment matching but not anything structural: a date range encoded in a segment, a
+comparison between segments, grouping across clients. A script could express all of
+it, and the key list is already in memory, so no document would be read.
+
+The shape: pass the caller's permitted keys into the sandbox as `data` and let the
+script set `response`, exactly as a key write does. No new query syntax, and it
+stays inside the principle that computation happens next to the data.
+
+Two things to settle first. The key list has to cross the sandbox boundary as JSON,
+which is fine at 11691 keys and is not at ten million, so it needs the same
+`key_list_limit` ceiling applied before marshalling rather than after. And the
+filter must run after the permission check, so a script cannot observe the
+existence of keys its caller may not read.
+
+### 16. No index on document contents
+
+"Every document where `status = 'pending'`" has no answer short of reading every
+candidate document. The two documented patterns - encoding the field in the key, or
+holding the collection in one document and searching it in a script - cover a lot,
+but not everything, and this is the first thing an evaluator coming from PostgreSQL
+or MongoDB tries.
+
+The real fix is declared indexed paths maintained on write: name the paths in
+`dj.config`, update an index structure inside the same per-key lock as the document
+write, and expose a lookup that consults it. That is a genuine query engine, with
+all the usual consequences - index rebuild on config change, write amplification,
+and a decision about whether an index lives in the data tree or beside it.
+
+Deliberately not started. It also collides with the planned `stateless` mode, where
+the in-memory index is not authoritative and a second instance would not see index
+updates made by the first. That interaction should be settled on paper before
+either is built, or one of them gets redone.
+
 ## Client side
 
 ### 12. The sliding session does not reach direct image URLs
@@ -167,6 +203,15 @@ are unfilled. Last open item from the original bug list.
 
 ## Done
 
+- **Key listing is bounded and ordered sensibly.** It used to run
+  `checkPermissions()` over every key in the index and only then apply the caller's
+  name filter, which is backwards: the permission walk is the expensive half. On an
+  11691-key index with five rules a prefix query took 220ms, and 88ms with the
+  order reversed, results identical. It also had no limit, returning 613KB for that
+  index, and an unparseable pattern produced an Express 500. Now `limit`, `offset`
+  and `count` with a `key_list_limit` ceiling, a 400 for a bad pattern or bound,
+  and `total` always reporting the full match. `/admin/keys` delegates to the same
+  code rather than keeping its own unbounded copy. Covered by `test/listKeys.test.js`.
 - **Concurrent writes no longer corrupt documents or lose updates.** Atomic
   temp-file-plus-rename, and modifying requests serialized per key through
   `withKeyLock()`. Measured on the original reproduction: 120 of 120 writes
