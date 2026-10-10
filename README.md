@@ -129,6 +129,8 @@ X-Device-Auth: {deviceId}:{timestamp}:{user}:{signature}
 
 **Password security**: passwords are stored as scrypt hashes (`scrypt:<salt>:<hash>`), verified with constant-time comparison. Plaintext passwords are never stored.
 
+**Live access changes**: `access.json` is read at startup and on `POST /admin/reload-access`, so adding a user or changing a permission needs no restart. A reload is all-or-nothing: the new file must parse and validate before it replaces anything, otherwise the running server keeps the access data it already had. Removing a user takes effect on their next request, even if they still hold a valid token.
+
 ### CRUDX Access Control
 
 Permissions are defined per group with regex patterns matching key names. Each rule carries a 5-character CRUDX string:
@@ -305,6 +307,7 @@ Admin routes require membership in the `admin` or `superadmin` group.
 | `GET /admin/modifications/:since` | Keys modified since a given counter value |
 | `POST /admin/rebuild-index` | Reconstruct the index from data files on disk |
 | `POST /admin/rotate-index` | Compact the index log, archive a snapshot, apply retention |
+| `POST /admin/reload-access` | Re-read `access.json` without restarting. A file that does not parse or validate is refused with the specific problems, and the previous access data stays in effect |
 | `GET /admin/logs` | Request logs from the past 7 days |
 
 ### Identity Endpoints

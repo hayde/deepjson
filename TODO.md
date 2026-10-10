@@ -385,5 +385,19 @@ are unfilled. Last open item from the original bug list.
 - **Per-group CORS whitelist** via `allowed_origins`, covering both the Express
   middleware and socket.io.
 - **Sliding session** through `X-Renewed-Token` on every authenticated response.
+- **Live `access.json` reload** via `POST /admin/reload-access`. The file used to be
+  read once in the constructor, so adding a user meant restarting the database, and
+  a JSON typo plus `Restart=always` meant a crash loop until someone fixed the file.
+  The reload is all-or-nothing: `collectAccessProblems()` was split out of
+  `validateConfig()` so a candidate file can be judged without throwing, and nothing
+  is swapped until it parses and validates. CORS and HMAC device auth needed no
+  extra wiring, since both read `accessData` per request.
+- **A token outliving its user is now rejected.** `authMiddleware()` left `req.user`
+  undefined for an unknown `decoded.id` and carried on, which then died inside
+  `checkPermissions()` as a 500 that read like a server fault. Tolerable while the
+  gap only opened across a restart; with a live reload a removed user has to be
+  revoked on their next request, so it returns 401. This changed the behaviour
+  recorded by an existing characterization test in `test/auth.test.js`, whose
+  original guarantee - that renewal must not crash without a `req.user` - still holds.
 - **Script sandbox test battery** in `bin/test-scripting.js`, 17 checks against a
   running server.

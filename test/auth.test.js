@@ -276,15 +276,20 @@ describe('authMiddleware (sliding session)', () => {
         assert.strictEqual(res.headers['X-Renewed-Token'], undefined);
     });
 
-    test('a valid token for a since-deleted user is not renewed, but still lets the request through', async () => {
-        // Mirrors existing behavior: authMiddleware doesn't reject an unknown
-        // decoded.id today, it just leaves req.user undefined. The renewal
-        // logic must not crash on that (no req.user.groups to read).
+    test('a valid token for a since-deleted user is rejected, not renewed', async () => {
+        // This used to pass the request through with req.user undefined, which then
+        // died inside checkPermissions() as a 500 that read like a server fault.
+        // It stayed that way because the gap only opened across a restart; with
+        // POST /admin/reload-access a user can be removed while the server runs, so
+        // a token outliving its user has to be rejected properly.
+        //
+        // The original guarantee this test was written for still holds: the renewal
+        // logic must not crash when there is no req.user to read groups from.
         const token = jwt.sign({ id: 'ghost', groups: ['editors'] }, SECRET, { expiresIn: '1h' });
-        const { req, res, nextCalled } = await run(token);
+        const { res, nextCalled } = await run(token);
 
-        assert.strictEqual(nextCalled, true);
-        assert.strictEqual(req.user, undefined);
+        assert.strictEqual(nextCalled, false, 'a revoked user must not reach the route');
+        assert.strictEqual(res.statusCode, 401);
         assert.strictEqual(res.headers['X-Renewed-Token'], undefined);
     });
 });

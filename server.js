@@ -423,6 +423,36 @@ class DeepJSONServer {
 
         /* ---- access.json ---- */
 
+        const accessProblems = this.collectAccessProblems(access);
+        errors.push(...accessProblems.errors);
+        warnings.push(...accessProblems.warnings);
+
+        warnings.forEach(w => console.warn(`Config warning: ${w}`));
+
+        if (errors.length) {
+            throw new Error(
+                `Invalid configuration (${errors.length} problem${errors.length > 1 ? 's' : ''}):\n` +
+                errors.map(e => `  - ${e}`).join('\n')
+            );
+        }
+    }
+
+    /**
+     * Collects every problem with an access.json shape, without throwing.
+     *
+     * Split out of validateConfig() so the same checks can judge a *candidate*
+     * file: reloadAccessData() has to be able to reject a broken file and keep
+     * serving with the access data it already has, which it cannot do if the only
+     * way to validate is a method that throws.
+     */
+    collectAccessProblems(access) {
+        const errors = [];
+        const warnings = [];
+        const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+        access = access || {};
+
+
         if (!isPlainObject(access.users)) {
             errors.push('access_file: "users" is missing or not an object');
         } else if (Object.keys(access.users).length === 0) {
@@ -497,14 +527,63 @@ class DeepJSONServer {
             }
         }
 
-        warnings.forEach(w => console.warn(`Config warning: ${w}`));
+        return { errors, warnings };
+    }
 
-        if (errors.length) {
-            throw new Error(
-                `Invalid configuration (${errors.length} problem${errors.length > 1 ? 's' : ''}):\n` +
-                errors.map(e => `  - ${e}`).join('\n')
-            );
+    /**
+     * Re-reads access_file and swaps it in, so adding a user or changing a
+     * permission no longer needs a restart of the whole database.
+     *
+     * Deliberately explicit rather than an fs.watch: a watcher fires on the
+     * partial file a text editor leaves mid-save, and there is no good way to
+     * report the resulting parse error to anyone.
+     *
+     * Nothing is swapped until the new file parses AND validates. A bad file
+     * leaves the running server exactly as it was, which is the whole point -
+     * the alternative is today's behaviour, where a typo plus a restart takes the
+     * database down until someone fixes the JSON.
+     *
+     * Not cached anywhere: getAllowedCorsOrigins() and the HMAC device lookup both
+     * read this.accessData per request, so CORS and device auth pick the new data
+     * up with no further wiring. Tokens already issued stay valid, since they are
+     * signed with jwt_secret and carry only an id - but a user removed from the
+     * file is now rejected on their next request, see authMiddleware().
+     */
+    async reloadAccessData() {
+        const accessPath = this.config.access_file;
+
+        let candidate;
+        try {
+            candidate = JSON.parse(await fsp.readFile(accessPath, 'utf8'));
+        } catch (err) {
+            const error = new Error(`Could not reload access_file "${accessPath}": ${err.message}`);
+            error.code = 'ACCESS_RELOAD_FAILED';
+            throw error;
         }
+
+        const { errors, warnings } = this.collectAccessProblems(candidate);
+        if (errors.length) {
+            const error = new Error(
+                `Refusing to reload access_file (${errors.length} problem${errors.length > 1 ? 's' : ''}); ` +
+                'the previous access data is still in effect'
+            );
+            error.code = 'ACCESS_RELOAD_FAILED';
+            error.problems = errors;
+            throw error;
+        }
+
+        warnings.forEach(w => console.warn(`Access reload warning: ${w}`));
+
+        const previous = this.accessData;
+        this.accessData = candidate;
+
+        return {
+            users: Object.keys(candidate.users || {}).length,
+            groups: Object.keys(candidate.groups || {}).length,
+            devices: Object.keys(candidate.devices || {}).length,
+            usersBefore: Object.keys(previous?.users || {}).length,
+            warnings
+        };
     }
 
     async createDirectories() {
@@ -965,6 +1044,19 @@ class DeepJSONServer {
         try {
             const decoded = jwt.verify(token, this.config.jwt_secret);
             req.user = this.accessData.users[decoded.id];
+
+            // A token can outlive the user it names: its signature stays valid for
+            // the full hour, so removing someone from access.json does not revoke
+            // what they already hold. Before reloadAccessData() that gap only
+            // opened across a restart; now it opens the moment the file is
+            // reloaded, which makes it worth closing properly.
+            //
+            // Without this the request continued with req.user undefined and died
+            // later inside checkPermissions(), as a 500 that reads like a server
+            // fault rather than a revoked account.
+            if (!req.user) {
+                return res.status(401).json({ error: 'Invalid authentication' });
+            }
 
             // Sliding session: a JWT's expiry is baked into its signature, so it
             // can't be extended in place. Instead, every successful, authenticated
@@ -1484,6 +1576,21 @@ class DeepJSONServer {
         router.post('/rotate-index', async (req, res) => {
             const result = await this.performIndexRotation();
             res.json({ status: 'success', ...result });
+        });
+
+        // Re-read access_file without restarting. A rejected file is a 400 with the
+        // specific problems, not a 500: the caller gave us a bad file, and the
+        // server is still serving happily on the previous one.
+        router.post('/reload-access', async (req, res) => {
+            try {
+                const result = await this.reloadAccessData();
+                res.json({ status: 'success', ...result });
+            } catch (err) {
+                if (err.code === 'ACCESS_RELOAD_FAILED') {
+                    return res.status(400).json({ error: err.message, problems: err.problems });
+                }
+                throw err;
+            }
         });
 
         router.get('/logs', async (req, res) => {
