@@ -289,7 +289,7 @@ The move operation verifies delete permission on the source, create/update permi
 DeepJSON maintains an append-only index log for fast key lookups without scanning the filesystem.
 
 - **In-memory index**: backed by a persistent log file (`dj.index`)
-- **Index rotation**: periodic compaction with dated archive snapshots
+- **Index rotation**: compaction with dated archive snapshots, on demand via `POST /admin/rotate-index` or periodically via `index_archiving.rotate_every_hours`
 - **Retention policy**: configurable `older_than_days` for automatic archive cleanup
 - **Rebuild from disk**: `POST /admin/rebuild-index` reconstructs the index from stored data files
 - **Modification counter**: global counter for efficient sync polling
@@ -304,6 +304,7 @@ Admin routes require membership in the `admin` or `superadmin` group.
 | `GET /admin/health` | Server uptime, storage stats, modification counter |
 | `GET /admin/modifications/:since` | Keys modified since a given counter value |
 | `POST /admin/rebuild-index` | Reconstruct the index from data files on disk |
+| `POST /admin/rotate-index` | Compact the index log, archive a snapshot, apply retention |
 | `GET /admin/logs` | Request logs from the past 7 days |
 
 ### Identity Endpoints
@@ -334,7 +335,8 @@ Both sit behind authentication, so they double as a connectivity check and token
 | `ssl.key` | string | Path to SSL private key |
 | `ssl.cert` | string | Path to SSL certificate |
 | `ssl.port` | number | HTTPS listening port |
-| `index_archiving.older_than_days` | number | Delete archived index snapshots older than this |
+| `index_archiving.older_than_days` | number | Delete archived index snapshots older than this. Applied during a rotation, so it needs `rotate_every_hours` or a manual `POST /admin/rotate-index` to take effect |
+| `index_archiving.rotate_every_hours` | number | Compact the index log every N hours. Omit to disable the schedule; the admin route stays available |
 | `preventDuplicateSessionConnections` | boolean | Prevent same user joining a session twice |
 | `allowMultipleSessionConnections` | boolean | Allow multiple connections per user per session |
 | `maxClientsPerSession` | number | Maximum clients per real-time session |

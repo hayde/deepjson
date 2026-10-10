@@ -16,6 +16,19 @@ const sharp = require('sharp');
 const { Server } = require('socket.io');
 const contentDisposition = require('content-disposition');
 
+/**
+ * Lock identity for the index log, used with withKeyLock().
+ *
+ * updateIndex() appends to dj.index while performIndexRotation() rewrites it from
+ * the in-memory state. Those two must never overlap: an append landing between
+ * rotation's snapshot and its write is present in memory but missing from the
+ * file, so it disappears at the next restart.
+ *
+ * A Symbol rather than a reserved string, so it cannot collide with a document
+ * key that happens to be named like an internal sentinel.
+ */
+const INDEX_LOCK = Symbol('deepjson.indexLog');
+
 
 
 /**
@@ -206,6 +219,34 @@ class DeepJSONServer {
         await this.createDirectories();
         await this.loadIndex();
         this.setupServer();
+        this.startIndexRotationSchedule();
+    }
+
+    /**
+     * Optional periodic compaction, driven by
+     * index_archiving.rotate_every_hours. Off unless configured, so an existing
+     * install keeps behaving exactly as before and an operator opts in; the admin
+     * route stays available either way.
+     *
+     * unref() so a pending timer never holds the process open at shutdown, and
+     * failures are logged rather than thrown, because an unhandled rejection in a
+     * background timer would take the server down over a housekeeping task.
+     */
+    startIndexRotationSchedule() {
+        const hours = Number(this.config.index_archiving?.rotate_every_hours);
+        if (!(hours > 0)) return null;
+
+        this._indexRotationTimer = setInterval(() => {
+            this.performIndexRotation().then(
+                (result) => console.log(
+                    `Index rotated: ${result.keys} keys, ${result.bytesBefore} -> ${result.bytesAfter} bytes`
+                ),
+                (err) => console.error('Scheduled index rotation failed:', err.message)
+            );
+        }, hours * 60 * 60 * 1000);
+        this._indexRotationTimer.unref();
+
+        return this._indexRotationTimer;
     }
 
     /**
@@ -352,12 +393,24 @@ class DeepJSONServer {
             if (!isPlainObject(cfg.index_archiving)) {
                 errors.push('index_archiving must be an object with older_than_days and/or archiving_url');
             } else {
-                const { older_than_days, archiving_url } = cfg.index_archiving;
+                const { older_than_days, archiving_url, rotate_every_hours } = cfg.index_archiving;
                 if (older_than_days !== undefined && !(Number(older_than_days) > 0)) {
                     errors.push(`index_archiving.older_than_days must be a positive number of days (got ${JSON.stringify(older_than_days)})`);
                 }
                 if (older_than_days === undefined && !archiving_url) {
                     warnings.push('index_archiving is set but has no older_than_days, so no archive snapshots will ever be deleted');
+                }
+                if (rotate_every_hours !== undefined && !(Number(rotate_every_hours) > 0)) {
+                    errors.push(`index_archiving.rotate_every_hours must be a positive number of hours (got ${JSON.stringify(rotate_every_hours)})`);
+                }
+                // Retention only ever runs as part of a rotation, so a day count
+                // without a schedule deletes nothing unless /admin/rotate-index is
+                // called by hand. Worth saying, since it reads as self-acting.
+                if (older_than_days !== undefined && rotate_every_hours === undefined) {
+                    warnings.push(
+                        'index_archiving.older_than_days is set but rotate_every_hours is not, so retention ' +
+                        'only runs when POST /admin/rotate-index is called manually'
+                    );
                 }
                 if (archiving_url !== undefined && archiving_url !== null && typeof archiving_url !== 'string') {
                     errors.push('index_archiving.archiving_url must be a string or null');
@@ -1425,6 +1478,14 @@ class DeepJSONServer {
             res.json({ status: 'success' });
         });
 
+        // Compaction of the append-only index log. Separate from rebuild-index:
+        // rebuild reconstructs the index by reading every data file on disk,
+        // rotate only rewrites the log from the index already in memory.
+        router.post('/rotate-index', async (req, res) => {
+            const result = await this.performIndexRotation();
+            res.json({ status: 'success', ...result });
+        });
+
         router.get('/logs', async (req, res) => {
             const logs = await this.getLogEntries();
             res.json(logs);
@@ -1526,6 +1587,16 @@ class DeepJSONServer {
 
     // Add to existing updateIndex method
     async updateIndex(req, key, operation, existingEntry = null) {
+        // Serialized against performIndexRotation() through INDEX_LOCK, so an
+        // append can never interleave with the rewrite of the same file. This is a
+        // different lock from the per-key one held by writeKeyData()/handleMove(),
+        // and nothing holding INDEX_LOCK takes a per-key lock, so the two cannot
+        // deadlock. Appends are a single appendFile, so the added contention is
+        // negligible next to the document write that precedes them.
+        return this.withKeyLock(INDEX_LOCK, () => this._updateIndex(req, key, operation, existingEntry));
+    }
+
+    async _updateIndex(req, key, operation, existingEntry = null) {
         const now = new Date().toISOString();
         var entry = this.index.get(key);
 
@@ -1739,6 +1810,7 @@ class DeepJSONServer {
      */
     async shutdown() {
         try {
+            if (this._indexRotationTimer) clearInterval(this._indexRotationTimer);
             // Save final index state
             await this.saveIndexSnapshot();
             console.log('Server shutdown complete');
@@ -1750,13 +1822,41 @@ class DeepJSONServer {
     async saveIndexSnapshot() {
         const indexPath = this.getIndexArchivePath();
 
+        // modCount is included even though loadIndex() never reads an archive:
+        // without it a snapshot cannot stand in for the live index, because every
+        // entry would come back as modCount 0 and reset the modification counter
+        // that /admin/modifications/:since relies on.
         const entries = Array.from(this.index.entries())
-            .map(([key, data]) => `${key}|${data.hash}|${data.created}|${data.modified}`);
+            .map(([key, data]) => `${key}|${data.hash}|${data.created}|${data.modified}|${data.modCount}`);
 
-        await fsp.writeFile(indexPath, entries.join('\n'));
+        await fsp.writeFile(indexPath, entries.length ? `${entries.join('\n')}\n` : '');
     }
 
+    /**
+     * Compacts the append-only index log: archives the current state as a dated
+     * snapshot, rewrites dj.index with one line per live key, then applies archive
+     * retention.
+     *
+     * Compaction is what keeps the log bounded. Every write appends a line, so
+     * without it the file grows forever and loadIndex() reads all of it at every
+     * startup - a key written a thousand times costs a thousand lines, of which
+     * only the last one matters. Rotating also drops DELETE tombstones, since a
+     * key absent from the in-memory index needs no record at all.
+     *
+     * Runs under INDEX_LOCK for the whole operation, the snapshot of this.index
+     * included, so no append can slip between reading the state and writing it.
+     *
+     * Returns what it did, so an operator calling this through the admin route can
+     * see whether it was worth running.
+     */
     async performIndexRotation() {
+        return this.withKeyLock(INDEX_LOCK, () => this._performIndexRotation());
+    }
+
+    async _performIndexRotation() {
+        const indexPath = this.getCurrentIndexPath();
+        const bytesBefore = await fsp.stat(indexPath).then(s => s.size).catch(() => 0);
+
         // Archive current index into index/archive/
         await this.saveIndexSnapshot();
 
@@ -1766,10 +1866,39 @@ class DeepJSONServer {
                 `${key}|${data.hash}|${data.created}|${data.modified}|${data.modCount}`
             );
 
-        await fsp.writeFile(this.getCurrentIndexPath(), newEntries.join('\n'));
+        // Same temp-file-plus-rename as writeKeyData(), for the same reason: a
+        // plain writeFile() truncates the live index first, so a crash midway
+        // through leaves a partial index and the next startup comes up silently
+        // missing keys. The temp file stays in the same directory to keep the
+        // rename atomic instead of degrading into a copy.
+        // The trailing newline is load-bearing: updateIndex() appends with
+        // appendFile(), so without it the next append is glued onto the last
+        // rotated line and loadIndex() parses the pair as one mangled entry,
+        // losing the appended key entirely. An empty index writes an empty file
+        // rather than a lone newline.
+        const payload = newEntries.length ? `${newEntries.join('\n')}\n` : '';
+        const tmpPath = path.join(
+            path.dirname(indexPath),
+            `.dj.index.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
+        );
+        try {
+            await fsp.writeFile(tmpPath, payload);
+            await fsp.rename(tmpPath, indexPath);
+        } catch (writeError) {
+            await fsp.unlink(tmpPath).catch(() => {});
+            throw writeError;
+        }
 
         // Enforce retention on the archive directory now that a new snapshot was added.
-        await this.cleanupIndexArchive();
+        const archivesRemoved = await this.cleanupIndexArchive();
+
+        return {
+            keys: this.index.size,
+            bytesBefore,
+            bytesAfter: Buffer.byteLength(payload),
+            archive: this.getIndexArchivePath(),
+            archivesRemoved
+        };
     }
 
     /**
@@ -1795,7 +1924,7 @@ class DeepJSONServer {
      */
     async cleanupIndexArchive() {
         const archivingConfig = this.config.index_archiving;
-        if (!archivingConfig) return;
+        if (!archivingConfig) return 0;
 
         if (archivingConfig.archiving_url) {
             console.warn(
@@ -1805,7 +1934,7 @@ class DeepJSONServer {
         }
 
         const olderThanDays = archivingConfig.older_than_days;
-        if (!olderThanDays || olderThanDays <= 0) return;
+        if (!olderThanDays || olderThanDays <= 0) return 0;
 
         const archiveDir = path.join(this.config.data_root, 'index', 'archive');
         const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
@@ -1814,10 +1943,11 @@ class DeepJSONServer {
         try {
             files = await fsp.readdir(archiveDir);
         } catch (error) {
-            if (error.code === 'ENOENT') return; // nothing archived yet
+            if (error.code === 'ENOENT') return 0; // nothing archived yet
             throw error;
         }
 
+        let removed = 0;
         for (const file of files) {
             const match = file.match(/^dj\.index\.(\d{4})(\d{2})(\d{2})$/);
             if (!match) continue; // ignore files that don't match the snapshot naming scheme
@@ -1827,8 +1957,10 @@ class DeepJSONServer {
 
             if (fileDate < cutoff) {
                 await fsp.unlink(path.join(archiveDir, file));
+                removed++;
             }
         }
+        return removed;
     }
 
     /**
