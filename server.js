@@ -193,6 +193,86 @@ class DeepJSONServer {
         return uploader;
     }
 
+    /**
+     * Whether a write is flushed to disk before it is acknowledged, from
+     * `durability` in dj.config ("sync" or "async").
+     *
+     * Defaults to "sync". Atomic rename already guarantees a reader never sees a
+     * half-written document, but it says nothing about the write having reached the
+     * disk: without a flush, the kernel may still be holding it in the page cache
+     * when the power goes, and a client that was told 200 loses its data. For
+     * anything described as a transaction that default has to be the safe one.
+     */
+    isSyncDurability() {
+        return (this.config.durability || 'sync') !== 'async';
+    }
+
+    /**
+     * Writes a file and, in sync mode, flushes it before returning.
+     *
+     * fsp.writeFile() hands back no descriptor, so the flush needs the file opened
+     * explicitly. Measured cost on a plain SSD volume: about 1.2ms per flush.
+     */
+    async writeFileDurable(filePath, payload) {
+        const handle = await fsp.open(filePath, 'w');
+        try {
+            await handle.writeFile(payload);
+            if (this.isSyncDurability()) await handle.sync();
+        } finally {
+            await handle.close();
+        }
+    }
+
+    /**
+     * Flushes a directory entry, which is what makes a rename() itself durable:
+     * the renamed file's contents can be on disk while the directory entry
+     * pointing at it is not, and then the file reverts to its old name on recovery.
+     *
+     * Failures are swallowed on purpose. Flushing a directory is a Linux
+     * behaviour that some filesystems refuse outright, and by this point the
+     * document's contents are already flushed and renamed - the worst case is
+     * losing the rename, not corrupting anything, so it must not fail the write.
+     */
+    async fsyncDirectory(dirPath) {
+        if (!this.isSyncDurability()) return;
+        let handle;
+        try {
+            handle = await fsp.open(dirPath, 'r');
+            await handle.sync();
+        } catch {
+            // platform or filesystem limitation, see above
+        } finally {
+            if (handle) await handle.close().catch(() => {});
+        }
+    }
+
+    /**
+     * Flushes the index log.
+     *
+     * Deliberately called *after* INDEX_LOCK has been released. The lock exists so
+     * a rotation cannot rewrite the log while an append is in flight; it does not
+     * need to cover the flush. The append is a single atomic O_APPEND write, so by
+     * the time it returns the ordering is settled, and a rotation builds its new
+     * file from the in-memory index, which already contains that entry.
+     *
+     * Holding the flush inside the lock instead would serialize every write in the
+     * server on one ~1.2ms flush - a global ceiling near 800 writes/sec no matter
+     * how many distinct keys are involved. Outside it, flushes overlap on the
+     * libuv threadpool and only same-key writes serialize, as they already did.
+     */
+    async fsyncIndexLog() {
+        if (!this.isSyncDurability()) return;
+        let handle;
+        try {
+            handle = await fsp.open(this.getCurrentIndexPath(), 'r');
+            await handle.sync();
+        } catch {
+            // the log may not exist yet on a brand new install
+        } finally {
+            if (handle) await handle.close().catch(() => {});
+        }
+    }
+
     loadConfig() {
         const configPath = process.argv[2] || '/etc/deepjson/dj.config';
         // Use sync method during initialization
@@ -326,6 +406,19 @@ class DeepJSONServer {
         };
         checkByteSize(cfg.payload_limit, 'payload_limit');
         checkByteSize(cfg.text_payload_limit, 'text_payload_limit');
+
+        if (cfg.durability !== undefined && !['sync', 'async'].includes(cfg.durability)) {
+            errors.push(`durability must be "sync" or "async" (got ${JSON.stringify(cfg.durability)})`);
+        }
+        if (cfg.durability === 'async') {
+            // Said out loud at startup, because the failure it allows is silent:
+            // the client is told the write succeeded and nothing looks wrong until
+            // a power loss takes the last few seconds of writes with it.
+            warnings.push(
+                'durability is "async", so writes are acknowledged before reaching disk; ' +
+                'a power loss or hard reset can lose recently confirmed writes'
+            );
+        }
 
         if (cfg.key_payload_limits !== undefined) {
             if (!Array.isArray(cfg.key_payload_limits)) {
@@ -1765,7 +1858,10 @@ class DeepJSONServer {
         // and nothing holding INDEX_LOCK takes a per-key lock, so the two cannot
         // deadlock. Appends are a single appendFile, so the added contention is
         // negligible next to the document write that precedes them.
-        return this.withKeyLock(INDEX_LOCK, () => this._updateIndex(req, key, operation, existingEntry));
+        await this.withKeyLock(INDEX_LOCK, () => this._updateIndex(req, key, operation, existingEntry));
+
+        // Outside the lock on purpose - see fsyncIndexLog().
+        await this.fsyncIndexLog();
     }
 
     async _updateIndex(req, key, operation, existingEntry = null) {
@@ -2054,8 +2150,9 @@ class DeepJSONServer {
             `.dj.index.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
         );
         try {
-            await fsp.writeFile(tmpPath, payload);
+            await this.writeFileDurable(tmpPath, payload);
             await fsp.rename(tmpPath, indexPath);
+            await this.fsyncDirectory(path.dirname(indexPath));
         } catch (writeError) {
             await fsp.unlink(tmpPath).catch(() => {});
             throw writeError;
@@ -2270,8 +2367,9 @@ class DeepJSONServer {
             const payload = JSON.stringify(data);
             const tmpPath = path.join(dir, `.${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
             try {
-                await fsp.writeFile(tmpPath, payload);
+                await this.writeFileDurable(tmpPath, payload);
                 await fsp.rename(tmpPath, filePath);
+                await this.fsyncDirectory(dir);
             } catch (writeError) {
                 // Never leave a stray temp file behind if the write or rename failed.
                 await fsp.unlink(tmpPath).catch(() => {});

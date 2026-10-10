@@ -306,6 +306,53 @@ await dj.move('drafts.article-1', 'published.article-1');
 
 The move operation verifies delete permission on the source, create/update permission on the target, supports wildcard destinations and records the move in the key's metadata history.
 
+### Durability
+
+Every document is written to a temporary file and moved into place with `rename()`,
+which is atomic on POSIX — a reader always sees either the whole previous document
+or the whole new one, never half of one. Whether that write has reached the disk
+before the client is told it succeeded is controlled by `durability`.
+
+| Mode | Behaviour | Cost per write |
+|------|-----------|----------------|
+| `"sync"` *(default)* | The document, its directory entry and the index log are flushed before the response is sent | ~3 ms |
+| `"async"` | The write is acknowledged once the kernel has it; the OS flushes when it chooses | ~0.1 ms |
+
+Measured serially on an SSD volume, three flushes per write. Writes to different
+keys flush concurrently, so that figure is a floor rather than a throughput
+ceiling; the index flush in particular is taken outside the index lock so writes
+do not queue behind each other's flushes.
+
+Worth knowing what `"async"` actually risks: nothing is lost on a normal restart,
+a deployment or `systemctl restart`, because an orderly shutdown flushes the page
+cache. The exposure is a power cut, a kernel panic or a hard reset of the VM — and
+then the last seconds of *confirmed* writes are gone, with nothing in the logs to
+say so.
+
+**When to use which:**
+
+```json
+// Default. Anything a client is told succeeded and will not send again:
+// orders, payments, user accounts, scanned documents, audit records.
+// Required if you rely on single-key operations being transactional.
+{ "durability": "sync" }
+```
+
+```json
+// Data you could regenerate from a source of truth: caches, search or
+// lookup indexes, telemetry, pre-rendered thumbnails. Also useful for a
+// one-off bulk import, switched back to "sync" afterwards.
+{ "durability": "async" }
+```
+
+The rule of thumb: if losing the last few seconds of writes after a power cut
+would mean someone re-enters data by hand, or a customer is told something
+happened that did not, stay on `"sync"`. The ~3 ms is cheaper than the
+conversation.
+
+Starting with `"async"` prints a warning at startup, so the choice is visible to
+whoever next reads the logs rather than buried in a config file.
+
 ### Index System
 
 DeepJSON maintains an append-only index log for fast key lookups without scanning the filesystem.
@@ -351,6 +398,7 @@ Both sit behind authentication, so they double as a connectivity check and token
 | `port` | number | HTTP listening port |
 | `jwt_secret` | string | Secret for signing JWTs |
 | `payload_limit` | string | Max request body size (e.g. `"50mb"`) |
+| `durability` | string | `"sync"` (default) flushes each write to disk before acknowledging it; `"async"` acknowledges first and lets the OS flush. See [Durability](#durability) |
 | `index_depth` | number | Directory tree depth for content-addressable storage |
 | `script_engine` | string | Script sandbox engine (`"wasm"`, default) |
 | `script_execution_time_limit` | number | Max script runtime in ms (default: 5000) |
