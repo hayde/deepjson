@@ -306,6 +306,60 @@ await dj.move('drafts.article-1', 'published.article-1');
 
 The move operation verifies delete permission on the source, create/update permission on the target, supports wildcard destinations and records the move in the key's metadata history.
 
+### Conditional Requests
+
+Every response for a key carries an `ETag` — the document's version. Send it back
+as `If-Match` on a write and the server refuses if the document has moved on.
+
+```http
+GET /keys/acct.1
+200 OK
+ETag: "2"
+
+PUT /keys/acct.1
+If-Match: "2"
+200 OK
+ETag: "3"          ← chain this into the next write, no re-read needed
+
+PUT /keys/acct.1
+If-Match: "2"      ← stale: someone else already wrote "3"
+412 Precondition Failed
+ETag: "3"
+{ "error": "Precondition failed: ...", "expected": "\"2\"", "current": "\"3\"" }
+```
+
+This closes a gap that per-key locking cannot. A write is serialized against other
+writes to the same key, so a script-driven read-modify-write inside one request is
+already safe. But a *client* that reads a document, decides something, and writes
+in a second request can be overtaken in between — and without `If-Match` its write
+wins silently, discarding whatever happened in the gap. With it, the second writer
+gets a 412 and can retry against the current state.
+
+| Header | Meaning |
+|--------|---------|
+| `If-Match: "3"` | Write only if the document is still at that version |
+| `If-Match: "2", "3"` | Write if it is at either (a list is an OR) |
+| `If-Match: *` | Write only if the key exists |
+| `If-None-Match: *` | Create only if the key does **not** exist |
+
+`If-Match` takes precedence over `If-None-Match`, per RFC 9110. Both work on `PUT`,
+`POST` and `DELETE` — a conditional delete removes a document only if nobody has
+touched it since you looked.
+
+Notes:
+
+- **Entirely opt-in.** A request without these headers behaves exactly as before,
+  so existing clients need no changes.
+- The 412 response carries the **current** `ETag`, so a client that loses a race
+  can retry straight away instead of issuing another `GET` first.
+- The tag comes from the document's own `_modCounter`, not the server-global
+  modification counter. That matters after a restore: `rebuild-index` renumbers the
+  global counter, while the per-document value is stored inside the document and
+  survives.
+- Input is read leniently — unquoted tags and a `W/` prefix are accepted, since
+  clients get those wrong often enough that refusing is unhelpful. What the server
+  emits is always a correctly quoted tag.
+
 ### Durability
 
 Every document is written to a temporary file and moved into place with `rename()`,

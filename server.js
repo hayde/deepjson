@@ -203,6 +203,84 @@ class DeepJSONServer {
      * when the power goes, and a client that was told 200 loses its data. For
      * anything described as a transaction that default has to be the safe one.
      */
+    /**
+     * Entity-tag for a stored document, from its own `_modCounter`.
+     *
+     * `_modCounter` is used rather than the server-global modificationCounter
+     * because it lives inside the document: it survives rebuild-index, a restore
+     * from backup and an index rotation. The global counter does not - a rebuild
+     * derives it from these values and renumbers, so an ETag built on it would
+     * silently become wrong after a restore.
+     */
+    etagFor(data) {
+        return `"${(data && data._modCounter) || 0}"`;
+    }
+
+    /**
+     * Strong comparison of an If-Match / If-None-Match header against the current
+     * entity-tag, with `null` meaning the key does not exist.
+     *
+     * Lenient on input, strict on output: the header may arrive unquoted or with a
+     * W/ prefix, which clients get wrong often enough that refusing is unhelpful,
+     * while what the server emits is always a correctly quoted tag.
+     */
+    etagMatches(headerValue, currentEtag) {
+        const normalize = (v) => String(v).trim().replace(/^W\//i, '').replace(/^"|"$/g, '');
+        const raw = String(headerValue).trim();
+
+        // "*" asks whether any representation exists at all.
+        if (raw === '*') return currentEtag !== null;
+        if (currentEtag === null) return false;
+
+        const current = normalize(currentEtag);
+        return raw.split(',').some(candidate => normalize(candidate) === current);
+    }
+
+    /**
+     * Evaluates the conditional-request headers against the document as it is right
+     * now, returning a 412 descriptor when the precondition fails.
+     *
+     * This closes the lost-update gap that per-key locking cannot: the lock covers
+     * one request, so a client that reads, decides something, and writes in a
+     * second request can still be overtaken in between. With If-Match the second
+     * request carries the version the decision was based on, and the server refuses
+     * if it has moved.
+     *
+     * MUST be called from inside withKeyLock(), after the document has been read.
+     * Evaluated earlier it would compare against a version that can change before
+     * the write lands, which is exactly the race being closed.
+     *
+     * If-Match takes precedence over If-None-Match, per RFC 9110 section 13.2.2.
+     */
+    evaluatePreconditions(req, currentEtag) {
+        const ifMatch = req.headers['if-match'];
+        const ifNoneMatch = req.headers['if-none-match'];
+
+        if (ifMatch === undefined && ifNoneMatch === undefined) return null;
+
+        if (ifMatch !== undefined) {
+            if (this.etagMatches(ifMatch, currentEtag)) return null;
+            return {
+                status: 412,
+                error: {
+                    error: 'Precondition failed: the key has changed since the version supplied in If-Match',
+                    expected: ifMatch,
+                    current: currentEtag
+                }
+            };
+        }
+
+        // If-None-Match: "*" is the conditional create - proceed only when absent.
+        if (!this.etagMatches(ifNoneMatch, currentEtag)) return null;
+        return {
+            status: 412,
+            error: {
+                error: 'Precondition failed: the key matches If-None-Match',
+                current: currentEtag
+            }
+        };
+    }
+
     isSyncDurability() {
         return (this.config.durability || 'sync') !== 'async';
     }
@@ -1487,6 +1565,20 @@ class DeepJSONServer {
             if (exists) {
                 data = await this.readKeyData(req, key);
             }
+
+            // 3b. Conditional request handling. Deliberately here: inside the lock
+            // and after the read, so the version compared against is the one the
+            // write will actually land on. The ETag goes out on every response,
+            // including the 412, so a client that loses the race learns the current
+            // version without a second round trip.
+            const currentEtag = exists ? this.etagFor(data) : null;
+            if (currentEtag !== null) res.set('ETag', currentEtag);
+
+            const failed = this.evaluatePreconditions(req, currentEtag);
+            if (failed) {
+                return res.status(failed.status).json(failed.error);
+            }
+
             // 4. Handle JavaScript execution
             if (parsed.script) {
                 // check, if excution is allowed
@@ -1581,7 +1673,11 @@ class DeepJSONServer {
                         response.options.error = { error: 'Key already exists (alternatively try "x-override-existing")' };
                     } else {
                         const tmp_data = response.data;
-                        await this.writeKeyData(req, res, key, tmp_data);
+                        // The ETag of the version just written, so a client running
+                        // a read-modify-write loop can chain its next If-Match
+                        // without re-reading the document.
+                        const written = await this.writeKeyData(req, res, key, tmp_data);
+                        res.set('ETag', this.etagFor(written));
                         response.options.status = 201;
                         if (generatedKey) {
                             response.response = { ok: "success", key: generatedKey };
@@ -1591,7 +1687,7 @@ class DeepJSONServer {
                     break;
                 //return res.status(201).json(response.response);
                 case 'PUT':
-                    await this.writeKeyData(req, res, key, response.data);
+                    res.set('ETag', this.etagFor(await this.writeKeyData(req, res, key, response.data)));
                     response.options.status = 200;
                     response.options.content = "json";
                     break;
