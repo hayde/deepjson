@@ -61,7 +61,17 @@ Fixes, in increasing order of what they solve:
    file, not `modCount` in the index, which is a global counter. This pushes retry
    handling onto clients and would be a breaking change for existing ones.
 
-### 0b. The index grows without bound
+### 0b. The index grew without bound — FIXED
+
+Fixed by making compaction reachable: `POST /admin/rotate-index` plus an optional
+`index_archiving.rotate_every_hours` schedule, see item 10. A rotation rewrites
+`dj.index` with one line per live key and drops DELETE tombstones. Measured on a
+test instance: six writes of one key, 840 bytes over 6 lines, became 127 bytes over
+1 line. Covered by `test/indexRotation.test.js`.
+
+The original analysis is kept below.
+
+---
 
 `updateIndex()` appends a line per operation ([server.js:1338](server.js#L1338))
 and nothing ever compacts it, because `performIndexRotation()` is unreachable, see
@@ -284,12 +294,46 @@ Two ceilings remain, and no configured number lifts them:
 
 ## Missing functionality
 
-### 10. `performIndexRotation()` is unreachable
+### 10. `performIndexRotation()` was unreachable — FIXED
 
-The method ([server.js:1449](server.js#L1449)) exists, complete with archiving and a
-retention window, but no route and no scheduler ever calls it. Rotation can only
-be triggered by a script today. Either add an admin route, or document explicitly
-that an external cron is meant to drive it.
+Fixed with an admin route and an optional schedule:
+
+- `POST /admin/rotate-index`, next to the existing `rebuild-index`. The two are
+  different operations and both are worth having: rebuild reconstructs the index by
+  reading every data file on disk, rotate only rewrites the log from the index
+  already in memory. The route returns what it did (keys, bytes before and after,
+  the archive path, snapshots removed) so an operator can see whether it was worth
+  running.
+- `index_archiving.rotate_every_hours`, off unless configured, so an existing
+  install keeps its current behaviour and an operator opts in. The timer is
+  `unref()`d and its failures are logged rather than thrown, since an unhandled
+  rejection in a housekeeping timer would otherwise take the server down.
+
+Two defects surfaced while wiring it up, both latent only because nothing called
+the method:
+
+1. **A rotation could silently lose a concurrent write.** `updateIndex()` appends to
+   `dj.index` while rotation rewrites it from the in-memory index, with no lock
+   between them. An append landing between rotation's snapshot and its write stayed
+   in memory but never reached the file, so the key disappeared at the next
+   restart. Both now serialize through an `INDEX_LOCK` symbol passed to the
+   existing `withKeyLock()`. It is a distinct lock from the per-key one, and nothing
+   holding it takes a per-key lock, so the two cannot deadlock.
+2. **The rotated file had no trailing newline**, so the next `appendFile()` glued
+   its line onto the last rotated one and `loadIndex()` parsed the pair as a single
+   mangled entry, losing the appended key and corrupting the modCount of the one
+   before it. Caught by the round-trip test, not by reading the code.
+
+Rotation now also writes through a temp file and `rename()`, like `writeKeyData()`,
+so a crash midway cannot leave a partial index that comes back missing keys. And
+`saveIndexSnapshot()` now records modCount, which it previously omitted: without it
+an archive snapshot could not stand in for the live index, because every entry
+would reload as modCount 0 and reset the counter `/admin/modifications/:since`
+depends on.
+
+Since retention runs only as part of a rotation, `older_than_days` without
+`rotate_every_hours` now raises a startup warning — it reads as self-acting but
+deletes nothing until a rotation happens.
 
 ### 11. `archiving_url` is documented but not implemented
 
