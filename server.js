@@ -1231,10 +1231,56 @@ class DeepJSONServer {
                 // untouched response stays undefined and JSON.stringify drops it
                 // from the payload entirely, while an explicit null survives as
                 // null. Seeding it with null made the two indistinguishable.
-                response: undefined
+                response: undefined,
+
+                // Left undefined for the same reason: only an unassigned abort can
+                // mean "the script did not refuse". See resolveScriptAbort().
+                abort: undefined
             })
         };
         return null;
+    }
+
+    /**
+     * Turns a script's `abort` into an HTTP status and body, or null when the
+     * script did not refuse.
+     *
+     * Why this exists: a script had no way to say "do not write". The wrapper
+     * always returns `data`, so a script that set only an error on `response` still
+     * handed back a storable document and the server wrote it - incrementing
+     * `_modCounter` and appending to the index for an operation the script had
+     * already rejected. A client reservation script doing exactly that is how one
+     * production key reached 34245 modifications: every failed attempt wrote too,
+     * and any client tracking that document's version saw it move for nothing.
+     *
+     * Accepted forms, in order of how specific they are:
+     *   abort = true                          -> 412, generic message
+     *   abort = "no slots left"               -> 412, that message
+     *   abort = { status: 409, error: {...} }  -> that status and body
+     *
+     * The status is clamped to 400-599: a script must not be able to claim 2xx for
+     * an operation that deliberately did not happen. 412 Precondition Failed is the
+     * default, because refusing based on the current state is what this is for.
+     */
+    resolveScriptAbort(abort) {
+        if (abort === undefined || abort === null || abort === false) return null;
+
+        let status = 412;
+        let error = { error: 'Operation aborted by script' };
+
+        if (typeof abort === 'string') {
+            error = { error: abort };
+        } else if (typeof abort === 'object') {
+            const candidate = Number(abort.status);
+            if (Number.isInteger(candidate) && candidate >= 400 && candidate <= 599) {
+                status = candidate;
+            }
+            if (abort.error !== undefined) {
+                error = typeof abort.error === 'string' ? { error: abort.error } : abort.error;
+            }
+        }
+
+        return { status, error };
     }
 
     /**
@@ -1364,7 +1410,17 @@ class DeepJSONServer {
                 // null as "unset" and sent the entire stored document back instead.
                 // See processScriptBody(): response is left undefined precisely so
                 // that undefined can mean "never assigned" here.
-                if (req.modifiable_method) {
+
+                // An abort is decided before anything else, because every branch
+                // below produces a document to store. Setting options.error here is
+                // what keeps the write from happening at all: the operation switch
+                // further down runs only when options.error is unset.
+                const aborted = this.resolveScriptAbort(response.abort);
+                if (aborted) {
+                    response.options.status = aborted.status;
+                    response.options.error = aborted.error;
+                    response.options.content = "json";
+                } else if (req.modifiable_method) {
                     if (response.data === undefined) {
                         // a modifiable call needs to set the "data" variable in the script!
                         response.options.status = 400;

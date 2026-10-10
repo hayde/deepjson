@@ -197,7 +197,27 @@ Scripts receive a context object with:
 | `hash` | SHA-256 hash of the key |
 | `http_method` | The HTTP method (GET, POST, PUT, DELETE) |
 | `response` | Set this to control what the client receives |
+| `abort` | Set this to refuse the operation: nothing is written and the request fails. `true` gives 412, a string becomes the message, `{ status, error }` sets both (status clamped to 400-599) |
 | `custom` | Persistent custom metadata on the record |
+
+Refusing an operation uses `abort`, which is also how arbitrary preconditions are
+expressed — any boolean logic over `data`, `custom`, `body` or `user`, with no
+separate query syntax to learn:
+
+```javascript
+// reject unless the document is still a draft
+await dj.put('reports.q3', { revenue: 50000 }, `
+  if (data.status !== 'draft') {
+    abort = { status: 409, error: 'only drafts may be edited' };
+  } else {
+    data = { ...data, revenue: body.revenue, status: 'review' };
+  }
+`);
+```
+
+Without `abort` a script cannot decline a write. Setting an error on `response`
+alone still returns the document to be stored, so the write happens anyway, the
+document's `_modCounter` advances and the request reports success.
 
 The script engine is configurable. The default is `wasm` (QuickJS compiled to WebAssembly), chosen for its strong isolation: even a bug in the JS engine itself cannot reach the host Node.js process.
 
