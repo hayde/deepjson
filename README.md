@@ -2,6 +2,47 @@
 
 A JSON document database with built-in server-side scripting, real-time synchronization and binary file storage. One server replaces what typically takes a database, a file store, a scripting layer and a WebSocket service.
 
+## Core principle: compute is cheap, transport is not
+
+Every feature in DeepJSON follows from one assumption: **CPU time on the server
+costs less than moving data to the client and back.** So manipulation belongs
+next to the data, and a response should carry the answer rather than the material
+needed to work it out.
+
+The difference is not marginal. Attaching four fields of metadata to a stored
+scanner document, the conventional way, means fetching the document, changing it
+locally and sending it back — for a 222 MB document that is roughly 444 MB over
+the wire and two round trips. The same operation as a server-side script is about
+150 bytes up and an acknowledgement down:
+
+```javascript
+await dj.put('scanner.bundle.' + hash, meta, `
+  if (!custom) custom = {};
+  custom.scanner = body;
+  response = { ok: true };
+`);
+```
+
+The document never leaves the server. The script runs where the data already is,
+and `response` controls what comes back — so the client receives the result, not
+the document.
+
+This is why the server looks the way it does:
+
+| Feature | What it avoids transporting |
+|---------|-----------------------------|
+| Server-side scripting | The document, in both directions, for every read-modify-write |
+| `response` separate from `data` | The whole stored value when the client only needs an answer |
+| `abort` and conditional requests | A round trip to discover the write should not happen |
+| On-the-fly image transformation | The full-resolution original, when a 400px thumbnail was wanted |
+| Real-time channels | Repeated polling for data that has not changed |
+| Wildcard key generation | A round trip to ask which identifier is free |
+
+The practical consequence for anyone building on it: if you find yourself reading
+a document in order to decide something and then writing it back, that logic
+belongs in a script. One round trip, no payload, and the operation is serialized
+against other writers for free.
+
 ## Why DeepJSON
 
 Most databases only store data. Everything else like scripting, file handling, real-time sync and access control must be handled separately. DeepJSON handles all of it in a single process with two config files.
@@ -171,6 +212,8 @@ Rules are evaluated in order: the **last matching rule wins**. This allows patte
 ### Server-Side Scripting
 
 Send JavaScript code with any request. Scripts execute in a sandboxed QuickJS WebAssembly environment. No access to Node.js APIs, the filesystem or the network. Memory and execution time are capped.
+
+This is the mechanism behind [the core principle](#core-principle-compute-is-cheap-transport-is-not): the script runs where the data already sits, so a read-modify-write costs one round trip and moves no document.
 
 ```javascript
 // Double every value in an array, server-side
