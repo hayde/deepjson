@@ -1384,14 +1384,55 @@ class DeepJSONServer {
             }
         }
     }
+    /**
+     * Which of the large context values a script actually mentions.
+     *
+     * Conservative on purpose. A false positive only means injecting something the
+     * script ignores, which is what always used to happen; a false negative would
+     * hand the script `undefined` where it expected a document. So anything that
+     * could reach a global without naming it - dynamic property access on
+     * globalThis, eval, the Function constructor, with - opts out of the
+     * optimisation entirely rather than being analysed.
+     *
+     * Word boundaries matter: `data.value` and `data =` both count, while
+     * `metadata` and `mydata` do not.
+     */
+    scriptReferences(code) {
+        const src = String(code || '');
+        const dynamic = /\b(globalThis|eval|Function|with)\b/.test(src);
+        const refers = (name) => dynamic || new RegExp(`\\b${name}\\b`).test(src);
+
+        return {
+            data: refers('data'),
+            origin: refers('origin'),
+            custom: refers('custom')
+        };
+    }
+
     // Add to handleKeyRequest body processing
     async processScriptBody(req, script, body, data) {
         if (script) {
-            return this.executeScript(req, script, {
-                origin: data,
-                custom: data ? data.custom : undefined,
+            // Only what the script refers to is marshalled across the sandbox
+            // boundary. `origin` is the whole stored record and `data` its value,
+            // so a script that touches neither used to pay for the document twice
+            // over: the context is serialized into a single JSON string, and for a
+            // large document that was the difference between a few hundred bytes
+            // and several hundred megabytes. Three production failures came out of
+            // it - a sandbox out-of-memory, a V8 "Invalid string length" at 396MB,
+            // and a script timeout - for writes that only attached metadata.
+            //
+            // Withholding a value breaks the round trip that the caller relies on:
+            // every context value is handed back by the wrapper, which is how an
+            // untouched `custom` survives a write and how `data = data` preserves a
+            // document. So whatever is withheld is restored below, and the caller
+            // cannot tell the difference.
+            const needs = this.scriptReferences(script);
+
+            const result = await this.executeScript(req, script, {
+                origin: needs.origin ? data : undefined,
+                custom: needs.custom ? (data ? data.custom : undefined) : undefined,
                 body: body,
-                data: data ? data.value : undefined,
+                data: needs.data ? (data ? data.value : undefined) : undefined,
                 user: req.user.user,
                 http_method: req.method,
                 key: data ? data._key : undefined,
@@ -1407,8 +1448,15 @@ class DeepJSONServer {
                 // Left undefined for the same reason: only an unassigned abort can
                 // mean "the script did not refuse". See resolveScriptAbort().
                 abort: undefined
-            })
-        };
+            });
+
+            // Restore what was withheld. `origin` needs nothing: the wrapper never
+            // returns it, so no caller can observe its absence.
+            if (!needs.data) result.data = data ? data.value : undefined;
+            if (!needs.custom) result.custom = data ? data.custom : undefined;
+
+            return result;
+        }
         return null;
     }
 

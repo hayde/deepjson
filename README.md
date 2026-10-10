@@ -228,6 +228,12 @@ await dj.put('reports.q3', { revenue: 50000 }, `
 `);
 ```
 
+Only the values a script actually mentions are sent into the sandbox. The context crosses the
+boundary as a single JSON string, and `origin` is the whole stored record while `data` is its
+value — so a script that touches neither never pays for the document. Anything withheld is
+restored afterwards, so a value a script does not mention survives the write untouched, exactly
+as if it had been passed in.
+
 Scripts receive a context object with:
 
 | Variable | Description |
