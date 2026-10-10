@@ -1179,12 +1179,21 @@ class DeepJSONServer {
         // Consider both 'admin' and 'superadmin' as admin roles
         const adminGroups = new Set(['admin', 'superadmin']);
 
-        return userEntry.groups.some(group =>
-            adminGroups.has(group) ||
-            this.accessData.groups[group]?.rules?.some(rule =>
-                rule.crudx?.[4] === '1' // Check execute permission (5th character)
-            )
-        );
+        // Group membership only, deliberately.
+        //
+        // This used to also return true for any group holding X on ANY rule, which
+        // silently turned script execution into full admin: a group scoped to one
+        // key prefix with crudx "11111" got /admin/keys, /admin/logs - seven days of
+        // request history across every client, unfiltered - plus rebuild-index and
+        // the newer rotate-index and reload-access. It needed no admin group and no
+        // rule matching anything under /admin.
+        //
+        // Verified on a live install before removing it: the `worker` group grants X,
+        // so its members were full admins without being in any admin group, and no
+        // successful /admin/* call existed in the whole request history, so nothing
+        // depended on the behaviour. Execute is a permission on keys; it is not a
+        // role, which is what the CRUDX model promises by keeping X separate.
+        return userEntry.groups.some(group => adminGroups.has(group));
     }
 
     async executeScript(req, code, context) {

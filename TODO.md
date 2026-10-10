@@ -385,6 +385,18 @@ are unfilled. Last open item from the original bug list.
 - **Per-group CORS whitelist** via `allowed_origins`, covering both the Express
   middleware and socket.io.
 - **Sliding session** through `X-Renewed-Token` on every authenticated response.
+- **Execute permission no longer confers admin.** `checkAdmin()` returned true for
+  any group holding X on any rule, so a group scoped to one key prefix with crudx
+  `11111` reached the whole `/admin/*` surface - including `/admin/logs`, which
+  returns seven days of request history across every client and is not filtered by
+  permission - without being in an admin group and without any rule matching
+  `/admin`. Demonstrated with two users differing only in the fifth CRUDX
+  character: 200 on every admin route versus 403. It is now group membership only,
+  which is what the README already claimed and what keeping X separate in the CRUDX
+  model is supposed to mean. Checked before removing it: on a live install the
+  `worker` group grants X, so its members held admin unknowingly, and no successful
+  `/admin/*` request existed anywhere in the request history, so nothing depended
+  on it. Covered by `test/checkAdmin.test.js`.
 - **Live `access.json` reload** via `POST /admin/reload-access`. The file used to be
   read once in the constructor, so adding a user meant restarting the database, and
   a JSON typo plus `Restart=always` meant a crash loop until someone fixed the file.
