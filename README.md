@@ -546,6 +546,72 @@ WebSocket sessions are held per instance in memory. Sticky sessions (session aff
 | Unified storage across instances | Shared storage with `stateless` mode (coming soon) |
 | Real-time at scale | Sticky sessions per channel |
 
+## Backup and restore
+
+Backups run against a live server. No downtime, no quiescing, and no snapshot
+support required from the filesystem.
+
+That works because of how documents are written: each one goes to a temporary file
+and is moved into place with `rename()`, so every file a copy picks up is a
+complete, valid document even if it was copied while that key was being written.
+
+### What to back up
+
+| Path | Needed? | Why |
+|------|---------|-----|
+| `<data_root>/data/` | **Yes** | The documents. The only data that cannot be reconstructed |
+| `/etc/deepjson/access.json` | **Yes** | Users, groups, password hashes. Lives outside `data_root` |
+| `/etc/deepjson/dj.config` | **Yes** | Server configuration. Also outside `data_root` |
+| `<data_root>/index/` | No | Rebuilt from the documents, see below |
+| `<data_root>/logs/` | Optional | Request history, not state |
+
+The two config files are the easy thing to miss: they are not under `data_root`, and
+a backup without `access.json` restores every document but no way to log in.
+
+```bash
+# Nightly, against a running server
+rsync -a --delete /var/lib/deepjson/data/ backup@store:/backups/deepjson/data/
+rsync -a /etc/deepjson/ backup@store:/backups/deepjson/etc/
+```
+
+### Restoring
+
+```bash
+# 1. Put the files back
+rsync -a backup@store:/backups/deepjson/data/ /var/lib/deepjson/data/
+rsync -a backup@store:/backups/deepjson/etc/  /etc/deepjson/
+
+# 2. Start the server. It comes up with an empty index and reports no keys.
+systemctl start deepjson
+
+# 3. Rebuild the index from the documents on disk
+curl -X POST https://your-host/admin/rebuild-index -H "Authorization: Bearer $TOKEN"
+```
+
+Step 3 is what makes the index disposable: `rebuild-index` walks the data tree and
+reconstructs every entry from the documents themselves, which carry their own
+`_key`, `_hash`, `_created`, `_modification` and `_modCounter`. Until it runs, keys
+are present on disk but absent from the index, so reads return 404.
+
+To rehearse a restore without touching production, point a second `dj.config` at a
+copy of the data with a different `port` and `data_root`, start it, rebuild, and
+compare `GET /cmd/keys/`.
+
+### Two things to know
+
+**A live copy has no cross-key consistency.** Each *file* is valid, but a copy can
+catch key A before a write and key B after it, so a change spanning two keys may be
+captured half-done. `POST /cmd/move` is read-write-delete, so a copy taken mid-move
+can hold both copies of a document or neither. If you need a consistent
+point-in-time image across keys, take a filesystem or volume snapshot (LVM, ZFS,
+btrfs, EBS) and copy from that instead.
+
+**A rebuild renumbers the modification counter.** The index's global counter is
+derived from each document's own `_modCounter` during a rebuild, so the values
+`/admin/modifications/:since` reports after a restore do not continue the old
+sequence. Clients polling that endpoint must reset their cursor rather than resume
+from the number they last saw.
+
 ## Comparison with Other Databases
 
 > 🟢 Built-in / native &nbsp;&nbsp; 🟡 Partial / separate service &nbsp;&nbsp; 🔴 Not available
