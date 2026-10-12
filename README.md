@@ -1,6 +1,6 @@
 # DeepJSON
 
-A JSON document database with built-in server-side scripting, real-time synchronization and binary file storage. One server replaces what typically takes a database, a file store, a scripting layer and a WebSocket servic.
+A JSON document database with built-in server-side scripting, real-time synchronization and binary file storage. One server replaces what typically takes a database, a file store, a scripting layer and a WebSocket service.
 
 ## Core principle: compute is cheap, transport is not
 
