@@ -288,6 +288,38 @@ document's `_modCounter` advances and the request reports success.
 
 The script engine is configurable. The default is `wasm` (QuickJS compiled to WebAssembly), chosen for its strong isolation: even a bug in the JS engine itself cannot reach the host Node.js process.
 
+#### Request bodies over plain HTTP
+
+The connectors handle this for you. Without one, the `Content-Type` of a
+`/keys/:key` body decides how it is read:
+
+| `Content-Type` | Body | Result |
+|----------------|------|--------|
+| `application/json`, `application/*+json` | Any JSON value | Stored as it is. Never executed. |
+| `text/plain` (any `text/*`) | Any JSON value | Stored as it is |
+| `text/plain` (any `text/*`) | `javascript: <code> javascript! <json>` | `<code>` runs as a script, `<json>` is its `body` |
+| `multipart/form-data` | A `file` field | Stored as a file |
+
+```bash
+# store a document
+curl -X POST https://your-host/keys/reports.q3 -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"revenue": 50000}'
+
+# run a script against it
+curl -X PUT https://your-host/keys/reports.q3 -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: text/plain' \
+  -d 'javascript: data.revenue += body.add; response = data; javascript! {"add": 100}'
+```
+
+A script can only be sent as `text/plain`. An `application/json` body is always
+data, even a JSON string that begins with `javascript:`, so a client that sends JSON
+can never trigger a script by accident.
+
+A body that cannot be read is refused rather than stored: malformed JSON gives
+`400`, a body or file over the key's size limit gives `413`, and a write in any
+other content type, or with none, gives `415`. These refusals are JSON, like every
+other error from `/keys/:key`.
+
 ### Real-Time Channels
 
 WebSocket-based sessions with a master/client model for live collaboration.
