@@ -600,8 +600,9 @@ sequence:
 4. Confirm with `GET /version`, which requires authentication and therefore
    proves the server is up, reachable and accepting logins in one call.
 
-### What not to copy from the setup script
+### The setup script
 
-`scripts/setup.sh` generates a starting configuration, but it is known to
-produce several faults and should not be treated as a reference. Use the complete
-example in this document instead.
+`scripts/setup.sh` generates a working starting configuration: a random
+`jwt_secret`, top-level session settings, and a sample device that stays disabled
+until you enable it. It does not set every option; use the complete example in
+this document for the rest.
