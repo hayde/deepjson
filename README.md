@@ -84,18 +84,22 @@ cd deepjson
 # Install dependencies
 npm install
 
-# Run the setup script (creates config and directories)
-bash deepjson-server-setup.sh
+# Run the setup script (creates config and directories, asks for sudo)
+bash scripts/setup.sh
 ```
 
 The setup script creates:
-- `/etc/deepjson/dj.config`: server configuration
-- `/etc/deepjson/access.json`: users, groups and permissions
+- `/etc/deepjson/dj.config`: server configuration, with a random `jwt_secret`
+- `/etc/deepjson/access.json`: one `admin` user; its password is generated and printed once
 - `/var/lib/deepjson/`: data, index, logs and scripts directories
+
+To choose the admin password yourself, run `DJ_ADMIN_PASSWORD='...' bash scripts/setup.sh`.
+Existing config files are kept; `--force` replaces them and keeps the old ones as `.bak`.
 
 ### 2. Configure
 
-Edit `/etc/deepjson/dj.config`:
+The generated configuration works as it is. To adjust it, edit `/etc/deepjson/dj.config`
+(full reference in [docs/CONFIGURATION.md](docs/CONFIGURATION.md)):
 
 ```json
 {
@@ -108,14 +112,13 @@ Edit `/etc/deepjson/dj.config`:
 }
 ```
 
-Set the admin password:
+To change a password later, hash it and paste the result into `access.json`
+under that user's `password` field:
 
 ```bash
 node bin/hash-password.js your-secure-password
 # outputs: scrypt:<salt>:<hash>
 ```
-
-Paste the result into `access.json` under the admin user's `password` field.
 
 ### 3. Start
 
@@ -666,7 +669,7 @@ deepjson/
 │       └── quickjs.js       # QuickJS/WASM sandbox
 ├── bin/
 │   └── hash-password.js     # CLI tool for scrypt password hashing
-├── deepjson-server-setup.sh # One-command server setup
+├── scripts/setup.sh         # One-command server setup
 └── test/                    # Tests (node:test, no external dependencies)
 ```
 
