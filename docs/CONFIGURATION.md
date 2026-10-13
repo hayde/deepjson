@@ -343,9 +343,10 @@ Three keys, applying to different paths, resolved in a defined order.
 | Required | no |
 | Default | `"10mb"` |
 
-Maximum size of a JSON request body, meaning any request sent with
-`Content-Type: application/json`. This covers `POST /auth/login` and the `/cmd/*`
-routes.
+Maximum size of a JSON request body outside `/keys/:key`, meaning any request sent
+with `Content-Type: application/json` to `POST /auth/login` or the `/cmd/*` routes.
+A key written as `application/json` is a key write and gets the key's limit instead,
+exactly like a `text/*` write (see `text_payload_limit` and `key_payload_limits`).
 
 Accepted forms are a plain number of bytes, or a string with a unit: `b`, `kb`,
 `mb`, `gb`, `tb`, `pb`. A value that is neither is rejected at startup.
@@ -358,8 +359,9 @@ Accepted forms are a plain number of bytes, or a string with a unit: `b`, `kb`,
 | Required | no |
 | Default | falls back to `payload_limit`, then `"10mb"` |
 
-Maximum size of a `text/*` request body written to `/keys/:key`. Since writing a
-key as `text/*` is the normal route, this is the limit users actually meet.
+Maximum size of a `text/*` or `application/json` request body written to
+`/keys/:key`. Since writing a key is the normal route, this is the limit users
+actually meet.
 
 Set it only when text writes should differ from everything else. It exists as a
 separate key because the underlying parser otherwise falls back to a built-in
