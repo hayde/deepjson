@@ -2,6 +2,8 @@
 
 A JSON document database with built-in server-side scripting, real-time synchronization and binary file storage. One server replaces what typically takes a database, a file store, a scripting layer and a WebSocket service.
 
+See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, including upgrade notes. The running server reports its own version at `GET /version`.
+
 ## Core principle: compute is cheap, transport is not
 
 Every feature in DeepJSON follows from one assumption: **CPU time on the server
@@ -461,12 +463,19 @@ in a second request can be overtaken in between — and without `If-Match` its w
 wins silently, discarding whatever happened in the gap. With it, the second writer
 gets a 412 and can retry against the current state.
 
-| Header | Meaning |
-|--------|---------|
-| `If-Match: "3"` | Write only if the document is still at that version |
-| `If-Match: "2", "3"` | Write if it is at either (a list is an OR) |
-| `If-Match: *` | Write only if the key exists |
-| `If-None-Match: *` | Create only if the key does **not** exist |
+| Header | On a write (POST/PUT/DELETE) | On a read (GET/HEAD) |
+|--------|------------------------------|----------------------|
+| `If-Match: "3"` | Proceed only if still at that version, else 412 | Return it only if still at that version, else 412 |
+| `If-Match: "2", "3"` | Proceed if at either (a list is an OR) | As above |
+| `If-Match: *` | Proceed only if the key exists | Return only if the key exists |
+| `If-None-Match: *` | Create only if the key does **not** exist, else 412 | **304 Not Modified** if it exists |
+| `If-None-Match: "3"` | Proceed only if *not* at that version, else 412 | **304 Not Modified** if at that version |
+
+`If-None-Match` deliberately means two different things. On a write it is the
+conditional create: a match is a failure. On a read it is cache revalidation — "I
+already hold this version, has it changed?" — where a match is the good answer and the
+reply is `304 Not Modified` with no body, as RFC 9110 requires. This is what lets a
+browser cache an image or a PDF served from a key and revalidate it cheaply.
 
 `If-Match` takes precedence over `If-None-Match`, per RFC 9110. Both work on `PUT`,
 `POST` and `DELETE` — a conditional delete removes a document only if nobody has
@@ -819,3 +828,6 @@ from the number they last saw.
 ## Contributing
 
 Contributions are welcome. Please open an issue or pull request on [GitHub](https://github.com/hayde/deepjson).
+
+Behaviour changes belong in [CHANGELOG.md](CHANGELOG.md) under `Unreleased`, with an
+upgrade note when an existing install would notice the difference.
