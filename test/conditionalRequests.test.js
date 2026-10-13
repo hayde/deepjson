@@ -68,7 +68,8 @@ describe('etagMatches', () => {
 });
 
 describe('evaluatePreconditions', () => {
-    const check = (h, current) => srv().evaluatePreconditions(headers(h), current);
+    const check = (h, current, method = 'PUT') =>
+        srv().evaluatePreconditions({ ...headers(h), method }, current);
 
     test('no conditional headers means no opinion', () => {
         assert.strictEqual(check({}, '"7"'), null);
@@ -103,6 +104,47 @@ describe('evaluatePreconditions', () => {
         const failed = check({ 'if-none-match': '*' }, '"0"');
         assert.strictEqual(failed.status, 412);
         assert.strictEqual(failed.error.current, '"0"');
+    });
+
+    // Reported from the field: opening a PDF a second time showed
+    // {"error":"Precondition failed..."} instead of the document. A browser
+    // revalidates a cached response with If-None-Match, and this returned 412 for
+    // every method, so the browser rendered the error text in place of the file -
+    // and only on the second view, which made it look intermittent.
+    //
+    // RFC 9110 13.1.2: on a match, GET and HEAD get 304 Not Modified; every other
+    // method gets 412. The same header means "I already hold this version" on a
+    // read and "only create if absent" on a write.
+    test('a matching If-None-Match on GET is 304, not an error', () => {
+        const result = check({ 'if-none-match': '"7"' }, '"7"', 'GET');
+        assert.strictEqual(result.status, 304);
+        assert.strictEqual(result.error, undefined, 'a 304 carries no body');
+    });
+
+    test('HEAD behaves like GET', () => {
+        assert.strictEqual(check({ 'if-none-match': '"7"' }, '"7"', 'HEAD').status, 304);
+    });
+
+    test('a non-matching If-None-Match on GET proceeds, so a stale cache is refreshed', () => {
+        assert.strictEqual(check({ 'if-none-match': '"6"' }, '"7"', 'GET'), null);
+    });
+
+    test('If-None-Match: * on GET of an existing key is 304', () => {
+        assert.strictEqual(check({ 'if-none-match': '*' }, '"7"', 'GET').status, 304);
+    });
+
+    test('writes still get 412, which is what protects a conditional create', () => {
+        for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) {
+            const result = check({ 'if-none-match': '"7"' }, '"7"', method);
+            assert.strictEqual(result.status, 412, method);
+            assert.ok(result.error, `${method} should explain itself`);
+        }
+    });
+
+    test('If-Match on a read is unaffected and still fails with 412', () => {
+        // Only If-None-Match is dual-meaning. A failed If-Match is an error on any
+        // method, per the same section of the spec.
+        assert.strictEqual(check({ 'if-match': '"6"' }, '"7"', 'GET').status, 412);
     });
 
     test('If-None-Match on a specific version refuses only on a match', () => {

@@ -270,8 +270,27 @@ class DeepJSONServer {
             };
         }
 
-        // If-None-Match: "*" is the conditional create - proceed only when absent.
+        // If-None-Match carries two different meanings depending on the method, and
+        // conflating them breaks ordinary browser caching.
+        //
+        // On a write it is the conditional create: "store this only if the key does
+        // not already exist", and a match is a failure worth reporting.
+        //
+        // On a read it is cache revalidation: "I already hold this version, has it
+        // changed?" - and a match is the *good* answer. A browser asks this on every
+        // second view of an image or PDF it has cached, and RFC 9110 section 13.1.2
+        // requires 304 Not Modified with no body for GET and HEAD, and 412 only for
+        // other methods. Answering 412 here made the browser render the error JSON in
+        // place of the document, and only on the second view, which is what made it
+        // look intermittent.
         if (!this.etagMatches(ifNoneMatch, currentEtag)) return null;
+
+        if (req.method === 'GET' || req.method === 'HEAD') {
+            // No body, and no error: the caller already set the ETag header, which a
+            // 304 should carry so the client can keep revalidating.
+            return { status: 304 };
+        }
+
         return {
             status: 412,
             error: {
@@ -1725,9 +1744,12 @@ class DeepJSONServer {
             const currentEtag = exists ? this.etagFor(data) : null;
             if (currentEtag !== null) res.set('ETag', currentEtag);
 
-            const failed = this.evaluatePreconditions(req, currentEtag);
-            if (failed) {
-                return res.status(failed.status).json(failed.error);
+            const precondition = this.evaluatePreconditions(req, currentEtag);
+            if (precondition) {
+                // A 304 must carry no body at all, so it cannot go out through
+                // res.json() like the failures do.
+                if (precondition.status === 304) return res.status(304).end();
+                return res.status(precondition.status).json(precondition.error);
             }
 
             // 4. Handle JavaScript execution
@@ -1789,7 +1811,21 @@ class DeepJSONServer {
                 // if this is a file upload, then the response is never the data uploaded itself.
                 if (res.locals.fileUpload) {
                     response.response = { ok: "upload successfull" };
-                    response.data = '{"data": "this is just a dummy, since the write function will handle the upload itselfe" }';
+
+                    // The existing record, or an empty object when the key is new.
+                    //
+                    // This used to be a placeholder string, on the reasoning that
+                    // writeKeyData() fills in the file itself. But writeKeyData()
+                    // decides new-versus-existing by looking for `_key` on what it is
+                    // given, and a string has none - so every upload took the
+                    // "brand new record" branch and reset `_modCounter` to 0,
+                    // reset `_created`, and dropped `custom`.
+                    //
+                    // The version never advancing is what made conditional requests
+                    // unusable for files: a browser holding ETag "0" was told 304 for
+                    // every later version of the document, so a replaced PDF was
+                    // served from cache indefinitely.
+                    response.data = data || {};
                 } else {
                     if (req.modifiable_method) {
                         // a modifiable request don't need a response.
