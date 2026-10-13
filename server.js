@@ -29,6 +29,10 @@ const contentDisposition = require('content-disposition');
  */
 const INDEX_LOCK = Symbol('deepjson.indexLog');
 
+// Content types accepted for /keys/:key bodies; any other type on a write gets 415.
+const JSON_BODY_TYPES = ['application/json', 'application/*+json'];
+const KEY_BODY_TYPES = ['text/*', ...JSON_BODY_TYPES, 'multipart/form-data'];
+
 
 
 /**
@@ -164,6 +168,35 @@ class DeepJSONServer {
     }
 
     /**
+     * JSON body-parser for one limit value, cached like _textParserFor(), so JSON
+     * key writes get the per-key limit. strict is off so any JSON value is
+     * accepted, as on the text/plain path.
+     */
+    _jsonParserFor(limit) {
+        if (!this._jsonParsers) this._jsonParsers = new Map();
+        let parser = this._jsonParsers.get(limit);
+        if (!parser) {
+            parser = express.json({
+                type: JSON_BODY_TYPES,
+                limit,
+                strict: false,
+                // Raw size, so an empty body can be treated as no body (body-parser makes it {}).
+                verify: (req, res, buf) => { res.locals.jsonBodyBytes = buf.length; }
+            });
+            this._jsonParsers.set(limit, parser);
+        }
+        return parser;
+    }
+
+    // True when the request carries body bytes. Unlike type-is, Content-Length: 0 is no body.
+    _hasBody(req) {
+        const headers = req.headers || {};
+        if (headers['transfer-encoding'] !== undefined) return true;
+        const length = Number(headers['content-length']);
+        return Number.isFinite(length) && length > 0;
+    }
+
+    /**
      * express-fileupload instance for one limit value, cached, mirroring
      * _textParserFor().
      *
@@ -186,7 +219,12 @@ class DeepJSONServer {
                 || 50 * 1024 * 1024;
             uploader = fileUpload({
                 limits: { fileSize },
-                abortOnLimit: true
+                abortOnLimit: true,
+                // Runs just before express-fileupload writes its 413, making that response JSON.
+                limitHandler: (req, res) => {
+                    if (!res.headersSent) res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                },
+                responseOnLimit: JSON.stringify({ error: `File is larger than the ${bytes.format(fileSize)} allowed for this key` })
             });
             this._fileUploaders.set(limit, uploader);
         }
@@ -879,37 +917,6 @@ class DeepJSONServer {
         // client nothing useful and tells a scanner which stack to target, so it goes.
         this.app.disable('x-powered-by');
 
-        // Core middleware
-        this.app.use(express.json({ limit: this.config.payload_limit || '10mb' }));
-
-        // key requests could be text.
-        //
-        // The limit has to be passed explicitly: without it express.text() falls
-        // back to body-parser's built-in 100kb default, which is far below
-        // payload_limit and silently caps the main key-write path (writing a key
-        // as text/* is the working route, so this limit is the one users hit).
-        //
-        // It is resolved per request rather than once at startup, because
-        // key_payload_limits lets it depend on which key is being written. See
-        // getPayloadLimitForKey() for the precedence.
-        this.app.use('/keys/:key', (req, res, next) => {
-            const limit = this.getPayloadLimitForKey(req.params.key);
-            return this._textParserFor(limit)(req, res, next);
-        });
-
-        // Same resolution for multipart file uploads, which used to run through a
-        // globally mounted express-fileupload pinned to 50MB. It was mounted before
-        // any route matched, so req.params.key did not exist yet and the limit could
-        // not depend on the key - which made key_payload_limits look like it covered
-        // uploads while it silently did not. Scoping it here is safe: req.files is
-        // read only by processFileUpload(), which no route outside /keys/:key
-        // reaches. express.text() above ignores multipart bodies, so the two
-        // parsers do not collide.
-        this.app.use('/keys/:key', (req, res, next) => {
-            const limit = this.getPayloadLimitForKey(req.params.key);
-            return this._fileUploadFor(limit)(req, res, next);
-        });
-
         // exposedHeaders: X-Renewed-Token carries the sliding-session token
         // (see authMiddleware()) - without this, browser-based clients can't
         // read it, even though the header is present in the raw response.
@@ -938,9 +945,11 @@ class DeepJSONServer {
             next();
         });
 
+        // JSON parser for the non-key routes that read a body: login, /cmd/move, POST /cmd/keys/.
+        const jsonBody = express.json({ limit: this.config.payload_limit || '10mb' });
 
         // Add login route 
-        this.app.post('/auth/login', this.handleLogin.bind(this));
+        this.app.post('/auth/login', jsonBody, this.handleLogin.bind(this));
         // Add middleware
         this.app.use(this.authMiddleware.bind(this)); // first usage of the route: check authentification
 
@@ -958,6 +967,54 @@ class DeepJSONServer {
             next();
         });
 
+        // Key bodies are parsed after CORS and auth, with the key's own size limit:
+        // unauthenticated bodies are never read, and parser errors keep CORS headers.
+        this.app.use('/keys/:key', (req, res, next) => {
+            const limit = this.getPayloadLimitForKey(req.params.key);
+            return this._jsonParserFor(limit)(req, res, (err) => {
+                if (!err && res.locals.jsonBodyBytes !== undefined) {
+                    if (res.locals.jsonBodyBytes === 0) {
+                        // Empty body: no body, as with text/plain.
+                        req.body = undefined;
+                    } else {
+                        // Marks a parsed JSON value, so 0, false and null are stored, not dropped.
+                        res.locals.jsonBody = true;
+                    }
+                }
+                next(err);
+            });
+        });
+
+        // key requests could be text.
+        //
+        // The limit has to be passed explicitly: without it express.text() falls
+        // back to body-parser's built-in 100kb default, which is far below
+        // payload_limit and silently caps the main key-write path (writing a key
+        // as text/* is the working route, so this limit is the one users hit).
+        //
+        // It is resolved per request rather than once at startup, because
+        // key_payload_limits lets it depend on which key is being written. See
+        // getPayloadLimitForKey() for the precedence.
+        this.app.use('/keys/:key', (req, res, next) => {
+            const limit = this.getPayloadLimitForKey(req.params.key);
+            return this._textParserFor(limit)(req, res, next);
+        });
+
+        // Same resolution for multipart file uploads, which used to run through a
+        // globally mounted express-fileupload pinned to 50MB. It was mounted before
+        // any route matched, so req.params.key did not exist yet and the limit could
+        // not depend on the key - which made key_payload_limits look like it covered
+        // uploads while it silently did not. Scoping it here is safe: req.files is
+        // read only by processFileUpload(), which no route outside /keys/:key
+        // reaches. express.text() above ignores multipart bodies, so the two
+        // parsers do not collide.
+        // Other multipart types are skipped so they get a 415 instead of a busboy 500.
+        this.app.use('/keys/:key', (req, res, next) => {
+            if (!this._isFileUpload(req)) return next();
+            const limit = this.getPayloadLimitForKey(req.params.key);
+            return this._fileUploadFor(limit)(req, res, next);
+        });
+
         // Identity and build info. Both sit behind authMiddleware, so they double as
         // a login check, and each response carries a fresh X-Renewed-Token.
         this.app.get('/version', this.handleVersion.bind(this));
@@ -971,13 +1028,16 @@ class DeepJSONServer {
             .delete(this.handleKeyRequest.bind(this));
 
         // move route
-        this.app.post('/cmd/move', this.handleMove.bind(this));
+        this.app.post('/cmd/move', jsonBody, this.handleMove.bind(this));
         this.app.route('/cmd/keys/')
             .get(this.handleListKeys.bind(this))
-            .post(this.handleListKeys.bind(this));
+            .post(jsonBody, this.handleListKeys.bind(this));
 
         // Admin routes
         this.setupAdminRoutes();
+
+        // Must stay last: it answers every error as JSON.
+        this.app.use(this.handleExpressError.bind(this));
 
         // Create servers
         if (this.config.ssl?.enabled) {
@@ -1253,6 +1313,39 @@ class DeepJSONServer {
      * 
      * it is implemented as app.use for all requests
      */
+    /**
+     * Final error handler: answers in JSON instead of Express's HTML page with a
+     * stack trace. A 4xx keeps its message; a 5xx is logged and answered
+     * generically, with the stack only when `debug` is on.
+     */
+    handleExpressError(err, req, res, next) {
+        if (res.headersSent) return next(err);
+
+        const candidate = err && (err.status || err.statusCode);
+        const status = Number.isInteger(candidate) && candidate >= 400 && candidate <= 599 ? candidate : 500;
+
+        let message;
+        if (err && err.type === 'entity.parse.failed') {
+            message = `Malformed JSON body: ${err.message}`;
+        } else if (err && err.type === 'entity.too.large') {
+            message = `Request body is larger than the ${bytes.format(err.limit)} allowed for this request`;
+        } else if (status < 500 && err && err.message) {
+            message = err.message;
+        } else {
+            message = 'Internal server error';
+        }
+
+        if (status >= 500) {
+            // req.path, not originalUrl: the query string may hold ?token=.
+            console.error(`${req.method} ${req.path} failed:`, err);
+        }
+
+        return res.status(status).json({
+            error: message,
+            stack: status >= 500 && this.config.debug && err ? err.stack : undefined
+        });
+    }
+
     async logRequest(req, res, error = null) {
         const logEntry = {
             timestamp: new Date().toISOString(),
@@ -1706,9 +1799,23 @@ class DeepJSONServer {
             }
 
             // 3. parse the body request
-            const parsed = this.parseScriptPayload(req.body);
+            // A write with a body no parser can read is refused, instead of storing null.
+            if (req.modifiable_method && !res.locals.fileUpload && this._hasBody(req) && !req.is(KEY_BODY_TYPES)) {
+                const type = req.headers['content-type'];
+                return res.status(415).json({
+                    error: `${type ? `Unsupported Content-Type "${type}"` : 'Missing Content-Type'}. `
+                        + 'Send a document as application/json or text/plain, a script as text/plain, '
+                        + 'or a file as multipart/form-data.'
+                });
+            }
+
+            const parsed = this.parseScriptPayload(req.body, {
+                parsedJson: res.locals.jsonBody === true,
+                fileUpload: res.locals.fileUpload === true
+            });
             if (parsed.error) {
-                throw new Error(parsed.error);
+                // An unreadable body is a client error.
+                return res.status(400).json({ error: parsed.error });
             }
 
             // 3. read the key data
@@ -1900,13 +2007,32 @@ class DeepJSONServer {
         return map[method] || 'R';
     }
 
-    parseScriptPayload(body) {
+    /**
+     * Splits a /keys/:key body into script and data. Scripts come only from the
+     * text/plain "javascript: ... javascript!" envelope; a JSON body is always data.
+     */
+    parseScriptPayload(body, { parsedJson = false, fileUpload = false } = {}) {
 
         const result = {
             script: null,
             body: null,
             error: null
         };
+
+        if (parsedJson) {
+            result.body = body === undefined ? null : body;
+            return result;
+        }
+
+        // Other non-text bodies: upload form fields are ignored, anything else is refused.
+        if (body !== undefined && body !== null && typeof body !== 'string') {
+            if (fileUpload) {
+                result.body = body;
+            } else {
+                result.error = 'The request body could not be read as text or JSON';
+            }
+            return result;
+        }
 
         if (!body) {
             // no body existing
@@ -2684,11 +2810,9 @@ class DeepJSONServer {
     }
 
     _isFileUpload(req) {
-        if (req.headers['content-type']?.startsWith('multipart/form-data')) {
-            return true;
-        } else {
-            return false;
-        }
+        // Case-insensitive, like express-fileupload itself.
+        const type = req.headers['content-type'];
+        return typeof type === 'string' && type.trim().toLowerCase().startsWith('multipart/form-data');
     }
 
     _isBinaryRequest(req) {

@@ -18,21 +18,6 @@ full analysis of a closed item is in this file's git history.
 
 Bugs that never raise their voice, which is why they survive so long.
 
-### 1. Writing a key with `application/json` crashes
-
-`parseScriptPayload()` ([server.js:1109](server.js#L1109)) expects a string and calls
-`.indexOf()` on it. With `Content-Type: application/json`, `express.json()` has
-already turned the body into an object, so it fails with
-`body.indexOf is not a function`. The identical request with `text/plain` works.
-
-The one content type you would try first against a JSON server is the only one
-that doesn't work.
-
-**The fix already exists in this project.** `parseMoveBody()`
-([server.js:2223](server.js#L2223)) handles exactly this case, checking
-`_.isObject(req.body)` before treating the body as text. `parseScriptPayload()`
-is missing that check.
-
 ### 2. `custom` is lost when a script creates the key
 
 `writeKeyData()` ([server.js:1605](server.js#L1605)) builds a fresh record for a key
@@ -141,11 +126,12 @@ own matches only `null`, because every real origin contains slashes. Allow exact
 two shapes: a port wildcard directly after a colon, and a subdomain wildcard
 directly before a dot with at least two labels following.
 
-### 8. No central error handling
+### 8. Central error handling — PARTLY DONE
 
-There is no Express error middleware. As a result a rejected CORS origin returns
-`500` instead of `403`, and an oversized body returns an HTML error page with a
-stack trace instead of JSON, which clients expecting JSON then fail to parse.
+`handleExpressError()` now answers everything Express catches in JSON, without a
+stack trace unless `debug` is on: malformed JSON is a `400`, an oversized body a
+`413`. Still open: a rejected CORS origin returns `500` instead of `403`, and an
+unknown route still gets Express's HTML 404 page.
 
 ## Missing functionality
 
@@ -222,6 +208,16 @@ are unfilled. Last open item from the original bug list.
 
 ## Done
 
+- **Writing a key with `application/json` works.** It used to fail with a `500`,
+  `body.indexOf is not a function`, because `express.json()` had already turned the
+  body into an object and `parseScriptPayload()` expected text. JSON key bodies now
+  have a key-scoped parser (so `key_payload_limits` applies to them, as it does to
+  text and uploads), any JSON value is stored exactly as its `text/plain`
+  equivalent, and a JSON body is never executed as a script. Two neighbours fixed
+  with it: a write in a content type no parser reads, such as
+  `application/octet-stream`, used to store `null` and report success and is now a
+  `415`; an unreadable body is a `400` instead of a `500`. Covered by
+  `test/contentType.test.js`.
 - **Key listing is bounded and ordered sensibly.** It used to run
   `checkPermissions()` over every key in the index and only then apply the caller's
   name filter, which is backwards: the permission walk is the expensive half. On an
