@@ -83,7 +83,7 @@ cd deepjson
 npm install
 
 # Run the setup script (creates config and directories)
-bash deepjson-server-setup.sh
+bash scripts/setup.sh
 ```
 
 The setup script creates:
@@ -625,7 +625,8 @@ deepjson/
 │       └── quickjs.js       # QuickJS/WASM sandbox
 ├── bin/
 │   └── hash-password.js     # CLI tool for scrypt password hashing
-├── deepjson-server-setup.sh # One-command server setup
+├── scripts/
+│   └── setup.sh             # One-command server setup
 └── test/                    # Tests (node:test, no external dependencies)
 ```
 
