@@ -29,6 +29,15 @@ const contentDisposition = require('content-disposition');
  */
 const INDEX_LOCK = Symbol('deepjson.indexLog');
 
+// Index lines written as JSON start with this prefix; see formatIndexLine().
+const INDEX_LINE_VERSION = 2;
+const INDEX_JSON_PREFIX = `{"v":${INDEX_LINE_VERSION},`;
+
+// Control characters, line breaks included, are refused in new key names.
+const KEY_CONTROL_CHARS = /[\x00-\x1F\x7F]/;
+// A lone UTF-16 surrogate cannot be written as UTF-8, so it would not survive a restart.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 // Content types accepted for /keys/:key bodies; any other type on a write gets 415.
 const JSON_BODY_TYPES = ['application/json', 'application/*+json'];
 const KEY_BODY_TYPES = ['text/*', ...JSON_BODY_TYPES, 'multipart/form-data'];
@@ -1483,6 +1492,14 @@ class DeepJSONServer {
         };
     }
 
+    // Why a new key name is refused, or null when it is acceptable.
+    keyNameProblem(key) {
+        if (typeof key !== 'string' || key.length === 0) return 'Key name must be a non-empty string';
+        if (KEY_CONTROL_CHARS.test(key)) return 'Key name must not contain control characters such as line breaks';
+        if (LONE_SURROGATE.test(key)) return 'Key name must be valid Unicode';
+        return null;
+    }
+
     checkPermissions(user, key, operation) {
         const permIndex = { C: 0, R: 1, U: 2, D: 3, X: 4 };
         const idx = permIndex[operation];
@@ -1787,6 +1804,12 @@ class DeepJSONServer {
                 req.modifiable_method = false;
             } else {
                 req.modifiable_method = true;
+            }
+
+            // New key names must not hold control characters; existing keys stay reachable.
+            if (req.method === 'POST' && !this.index.has(key)) {
+                const problem = this.keyNameProblem(key);
+                if (problem) return res.status(400).json({ error: problem });
             }
 
             if (key.includes("*")) {
@@ -2201,6 +2224,49 @@ class DeepJSONServer {
     }
 
     /**
+     * One index line: "key|hash|created|modified|modCount[|operation|user]".
+     * A key holding "|" or a line break (or a user holding a line break) would be
+     * misread, and could forge entries, so such a line is written as JSON instead.
+     * Ordinary keys keep the pipe form, so an older server can still read the index.
+     */
+    formatIndexLine(key, entry, operation, user) {
+        const fields = [key, entry.hash, entry.created, entry.modified, entry.modCount];
+        if (operation !== undefined) fields.push(operation);
+        // The user is the last field and is never parsed, so only a line break can break it.
+        const pipeSafe = typeof key === 'string' && !key.startsWith('{') && !LONE_SURROGATE.test(key)
+            && fields.every((field) => !/[|\r\n]/.test(String(field)))
+            && (operation === undefined || !/[\r\n]/.test(String(user)));
+        if (operation !== undefined) fields.push(user);
+        if (pipeSafe) return fields.map(String).join('|');
+
+        const line = { v: INDEX_LINE_VERSION, k: key, h: entry.hash, c: entry.created, m: entry.modified, n: entry.modCount };
+        if (operation !== undefined) Object.assign(line, { op: operation, u: user });
+        return JSON.stringify(line);
+    }
+
+    // Parses either line form; null for a line too damaged to name its key.
+    parseIndexLine(line) {
+        if (line.startsWith(INDEX_JSON_PREFIX)) {
+            let o;
+            try { o = JSON.parse(line); } catch { o = undefined; }
+            if (o !== undefined) {
+                return o && typeof o.k === 'string'
+                    ? { key: o.k, hash: o.h, created: o.c, modified: o.m, modCount: o.n, operation: o.op }
+                    : null;
+            }
+            // Not JSON: a cut-off line, or a legacy key that begins with the prefix.
+            // Only a complete legacy line (5+ fields, a real hash) is accepted.
+            const legacy = line.split('|');
+            if (legacy.length < 5 || !/^[0-9a-f]{64}$/.test(legacy[1])) return null;
+        }
+        const fields = line.split('|');
+        // Without a "|" the key itself may be cut off, e.g. by a crash mid-append.
+        if (fields.length < 2) return null;
+        const [key, hash, created, modified, modCount, operation] = fields;
+        return { key, hash, created, modified, modCount, operation };
+    }
+
+    /**
      * Path of a dated archive snapshot (index/archive/dj.index.YYYYMMDD), kept
      * separate from the live index log so index/ itself doesn't accumulate one
      * file per rotation forever. See cleanupIndexArchive() for retention.
@@ -2223,10 +2289,16 @@ class DeepJSONServer {
         try {
             const data = await fsp.readFile(indexPath, 'utf8');
             let maxModCount = 0;
+            let skipped = 0;
 
-            data.split('\n').forEach(entry => {
-                if (entry.trim()) {
-                    const [key, hash, created, modified, modCount, operation] = entry.split('|');
+            data.split('\n').forEach(line => {
+                if (line.trim()) {
+                    const parsed = this.parseIndexLine(line);
+                    if (!parsed) {
+                        skipped++;
+                        return;
+                    }
+                    const { key, hash, created, modified, modCount, operation } = parsed;
 
                     // Handle DELETE operations
                     if (operation === 'DELETE') {
@@ -2245,6 +2317,9 @@ class DeepJSONServer {
                 }
             });
 
+            if (skipped) {
+                console.warn(`Index: skipped ${skipped} unreadable line(s) in ${indexPath}; POST /admin/rebuild-index followed by POST /admin/rotate-index restores it from the data files`);
+            }
             this.modificationCounter = maxModCount;
         } catch (error) {
             if (error.code === 'ENOENT') {
@@ -2298,7 +2373,7 @@ class DeepJSONServer {
 
         }
         // Append to daily index log
-        const logEntry = `${key}|${entry.hash}|${entry.created}|${entry.modified}|${entry.modCount}|${operation}|${req.user?.id || 'system'}\n`;
+        const logEntry = `${this.formatIndexLine(key, entry, operation, req.user?.id || 'system')}\n`;
         await fsp.appendFile(
             this.getCurrentIndexPath(),
             logEntry
@@ -2345,7 +2420,7 @@ class DeepJSONServer {
         try {
             const raw = await fsp.readFile(filePath, 'utf8');
             const data = JSON.parse(raw);
-            if (!data._key) return null;
+            if (typeof data._key !== 'string' || !data._key) return null;
 
             return {
                 key: data._key,
@@ -2508,7 +2583,7 @@ class DeepJSONServer {
         // entry would come back as modCount 0 and reset the modification counter
         // that /admin/modifications/:since relies on.
         const entries = Array.from(this.index.entries())
-            .map(([key, data]) => `${key}|${data.hash}|${data.created}|${data.modified}|${data.modCount}`);
+            .map(([key, data]) => this.formatIndexLine(key, data));
 
         await fsp.writeFile(indexPath, entries.length ? `${entries.join('\n')}\n` : '');
     }
@@ -2543,9 +2618,7 @@ class DeepJSONServer {
 
         // Start new index with current state
         const newEntries = Array.from(this.index.entries())
-            .map(([key, data]) =>
-                `${key}|${data.hash}|${data.created}|${data.modified}|${data.modCount}`
-            );
+            .map(([key, data]) => this.formatIndexLine(key, data));
 
         // Same temp-file-plus-rename as writeKeyData(), for the same reason: a
         // plain writeFile() truncates the live index first, so a crash midway
@@ -3332,6 +3405,13 @@ class DeepJSONServer {
             // 1. Validate parameters
             if (!from || !rawTo) {
                 return res.status(400).json({ error: 'Missing "from" or "to" in request body' });
+            }
+            if (typeof from !== 'string' || typeof rawTo !== 'string') {
+                return res.status(400).json({ error: '"from" and "to" must be strings' });
+            }
+            const toProblem = this.index.has(rawTo) ? null : this.keyNameProblem(rawTo);
+            if (toProblem) {
+                return res.status(400).json({ error: `Invalid "to": ${toProblem}` });
             }
 
             // 2. Process wildcard in destination

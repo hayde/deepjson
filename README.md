@@ -402,6 +402,10 @@ await dj.post('logs.*{type:random}', { event: 'user_signup' });
 
 ### Key Operations
 
+**Key names** may contain any character except control characters (U+0000 to
+U+001F and U+007F, such as line breaks or tabs) and invalid Unicode; creating such a
+key is refused with `400`. Keys that already exist stay reachable.
+
 **Move/Rename** with full permission checks and key history tracking:
 
 ```javascript
@@ -584,7 +588,7 @@ DeepJSON maintains an append-only index log for fast key lookups without scannin
 - **In-memory index**: backed by a persistent log file (`dj.index`)
 - **Index rotation**: compaction with dated archive snapshots, on demand via `POST /admin/rotate-index` or periodically via `index_archiving.rotate_every_hours`
 - **Retention policy**: configurable `older_than_days` for automatic archive cleanup
-- **Rebuild from disk**: `POST /admin/rebuild-index` reconstructs the index from stored data files
+- **Rebuild from disk**: `POST /admin/rebuild-index` reconstructs the index from stored data files; follow it with `POST /admin/rotate-index` to write the rebuilt index to `dj.index`
 - **Modification counter**: global counter for efficient sync polling
 
 ### Admin API
@@ -809,8 +813,9 @@ rsync -a backup@store:/backups/deepjson/etc/  /etc/deepjson/
 # 2. Start the server. It comes up with an empty index and reports no keys.
 systemctl start deepjson
 
-# 3. Rebuild the index from the documents on disk
+# 3. Rebuild the index from the documents on disk, then write it to dj.index
 curl -X POST https://your-host/admin/rebuild-index -H "Authorization: Bearer $TOKEN"
+curl -X POST https://your-host/admin/rotate-index -H "Authorization: Bearer $TOKEN"
 ```
 
 Step 3 is what makes the index disposable: `rebuild-index` walks the data tree and
