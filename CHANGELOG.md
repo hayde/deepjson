@@ -9,6 +9,34 @@ change affects what a client sees on the wire, it says so.
 
 ## [Unreleased]
 
+### Security
+
+- **A key name could forge entries in the index log.** Keys were written into
+  `dj.index` unescaped, so a key holding a line break or `|` could plant a fake
+  line, for example a `DELETE` of another user's key that took effect at the next
+  restart. Index lines are now written so no key can break them: ordinary keys keep
+  the existing `key|hash|...` form, and a line that a key could break (a key
+  containing `|`, a line break or invalid Unicode, or starting with `{`, or a user id
+  containing a line break) is written as one JSON line. Keys with `|` written from
+  now on survive a restart under their exact name, which they did not before. Creating a key whose
+  name contains control characters or invalid Unicode is refused with `400`;
+  existing keys stay reachable. `/cmd/move` returns `400` for a non-string `from` or
+  `to`.
+
+### Upgrade notes
+
+- **If the server was reachable by untrusted users before this release**, `dj.index`
+  may hold forged lines, including some that only take effect on this version. Before
+  the first start, check `grep -n '^{"v":2,' index/dj.index`: an index written by an
+  earlier version must not contain such lines. If it does, or to be safe, run
+  `POST /admin/rebuild-index` followed by `POST /admin/rotate-index` after starting.
+  Data files are never affected.
+- **Keys containing `|` written by an earlier version** are in the index under a
+  truncated name. The same rebuild followed by rotate restores their exact names.
+- **Rolling back** to an earlier version keeps working for ordinary keys. Keys
+  containing `|`, a line break, or starting with `{` would be misread again, and the
+  original issue returns with the old version.
+
 ## [1.1.0] - 2026-10-13
 
 The first release since the initial commit, so it covers a lot. Two items need
