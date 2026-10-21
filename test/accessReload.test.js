@@ -14,10 +14,13 @@ const os = require('node:os');
 const path = require('node:path');
 const { test, describe } = require('node:test');
 const DeepJSONServer = require('../server');
+// Well-formed password hashes with no known password; these tests never log in.
+const HASH_A = `scrypt:${'a'.repeat(32)}:${'b'.repeat(128)}`;
+const HASH_B = `scrypt:${'c'.repeat(32)}:${'d'.repeat(128)}`;
 
 const validAccess = () => ({
     users: {
-        alice: { id: 'alice', email: 'a@example.com', password: 'scrypt:aa:bb', groups: ['editors'] }
+        alice: { id: 'alice', email: 'a@example.com', password: HASH_A, groups: ['editors'] }
     },
     groups: {
         editors: { rules: [{ regex: '^public\\..*', crudx: '11110' }] }
@@ -43,7 +46,7 @@ describe('reloadAccessData - happy path', () => {
         assert.strictEqual(srv.accessData.users.bob, undefined);
 
         const next = validAccess();
-        next.users.bob = { id: 'bob', email: 'b@example.com', password: 'scrypt:cc:dd', groups: ['editors'] };
+        next.users.bob = { id: 'bob', email: 'b@example.com', password: HASH_B, groups: ['editors'] };
         await write(accessPath, next);
 
         const result = await srv.reloadAccessData();
@@ -139,7 +142,7 @@ describe('reloadAccessData - rejection keeps the server serving', () => {
         await write(accessPath, broken);
 
         await assert.rejects(() => srv.reloadAccessData(), /Refusing to reload access_file/);
-        assert.strictEqual(srv.accessData.users.alice.password, 'scrypt:aa:bb');
+        assert.strictEqual(srv.accessData.users.alice.password, HASH_A);
     });
 
     test('an uncompilable rule regex is refused', async () => {

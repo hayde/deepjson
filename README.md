@@ -173,7 +173,7 @@ pip install deepjson-py-connector
 X-Device-Auth: {deviceId}:{timestamp}:{user}:{signature}
 ```
 
-**Password security**: passwords are stored as scrypt hashes (`scrypt:<salt>:<hash>`), verified with constant-time comparison. Plaintext passwords are never stored.
+**Password security**: passwords are stored as scrypt hashes (`scrypt:<salt>:<hash>`), verified with constant-time comparison. Plaintext passwords are never stored. A stored value that is not a well-formed hash never matches, and stops the server at startup; `"password": null` disables password login for an account used only through device authentication.
 
 **Live access changes**: `access.json` is read at startup and on `POST /admin/reload-access`, so adding a user or changing a permission needs no restart. A reload is all-or-nothing: the new file must parse and validate before it replaces anything, otherwise the running server keeps the access data it already had. Removing a user takes effect on their next request, even if they still hold a valid token.
 
