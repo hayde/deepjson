@@ -11,6 +11,9 @@
 const assert = require('node:assert');
 const { test, describe } = require('node:test');
 const DeepJSONServer = require('../server');
+// Well-formed password hashes with no known password; these tests never log in.
+const HASH_A = `scrypt:${'a'.repeat(32)}:${'b'.repeat(128)}`;
+const HASH_B = `scrypt:${'c'.repeat(32)}:${'d'.repeat(128)}`;
 
 function makeRes() {
     return {
@@ -23,8 +26,8 @@ function makeRes() {
 
 const accessData = () => ({
     users: {
-        alice: { id: 'alice', email: 'alice@example.com', password: 'scrypt:aa:bb', groups: ['editors'] },
-        root: { id: 'root', email: 'root@example.com', password: 'scrypt:cc:dd', groups: ['superadmin'] }
+        alice: { id: 'alice', email: 'alice@example.com', password: HASH_A, groups: ['editors'] },
+        root: { id: 'root', email: 'root@example.com', password: HASH_B, groups: ['superadmin'] }
     },
     groups: {
         editors: { rules: [{ regex: '.*', crudx: '11110' }] },

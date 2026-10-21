@@ -18,6 +18,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { test, describe } = require('node:test');
 const DeepJSONServer = require('../server');
+// Well-formed password hashes with no known password; these tests never log in.
+const HASH_A = `scrypt:${'a'.repeat(32)}:${'b'.repeat(128)}`;
 
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const req = { user: { id: 'tester' } };
@@ -169,7 +171,7 @@ describe('validateConfig - durability', () => {
             durability
         };
         srv.accessData = {
-            users: { alice: { id: 'alice', password: 'scrypt:aa:bb', groups: ['editors'] } },
+            users: { alice: { id: 'alice', password: HASH_A, groups: ['editors'] } },
             groups: { editors: { rules: [{ regex: '.*', crudx: '11110' }] } }
         };
         return () => srv.validateConfig();
