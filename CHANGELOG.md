@@ -7,7 +7,7 @@ All notable changes to the DeepJSON server. The format follows
 Client connectors are versioned separately and move faster than the server; where a
 change affects what a client sees on the wire, it says so.
 
-## [Unreleased]
+## [1.2.0] / 2026-10-22
 
 ### Security
 
@@ -57,7 +57,7 @@ change affects what a client sees on the wire, it says so.
   containing `|`, a line break, or starting with `{` would be misread again, and the
   original issue returns with the old version.
 
-## [1.1.0] - 2026-10-13
+## [1.2.0] - 2026-10-13
 
 The first release since the initial commit, so it covers a lot. Two items need
 attention before upgrading — see **Upgrade notes** at the end.
