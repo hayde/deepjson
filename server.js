@@ -4,6 +4,7 @@ const fs = require('fs'); // Regular fs for sync methods
 const fsp = require('fs').promises; // Promise-based fs
 const path = require('path');
 const { getScriptEngine, AVAILABLE_ENGINES, DEFAULT_ENGINE } = require('./lib/scriptEngines');
+const passwordHash = require('./lib/password');
 const moment = require('moment');
 const _ = require('lodash');
 const https = require('https');
@@ -816,10 +817,18 @@ class DeepJSONServer {
                         errors.push(`access_file: user "${userId}" references unknown group "${group}"`);
                     }
                 }
+                // A malformed hash used to accept any password at login (issue #26), so
+                // it stops the server. "password": null disables password login, for
+                // accounts used only through device authentication.
+                const passwordFix = 'create one with: node bin/hash-password.js <password>, or set "password": null to disable password login for this user';
                 if (user.password === undefined) {
-                    errors.push(`access_file: user "${userId}" has no password`);
-                } else if (typeof user.password === 'string' && !user.password.startsWith('scrypt:')) {
-                    errors.push(`access_file: user "${userId}" has a password that is not a scrypt hash; run hashPassword() and store the result`);
+                    errors.push(`access_file: user "${userId}" has no password; ${passwordFix}`);
+                } else if (typeof user.password === 'string') {
+                    if (!passwordHash.isPasswordHash(user.password)) {
+                        errors.push(`access_file: user "${userId}" has a password that is not a scrypt hash in the form ${passwordHash.HASH_FORMAT}; ${passwordFix}`);
+                    }
+                } else if (user.password !== null) {
+                    warnings.push(`access_file: user "${userId}" has a password that is not a string, so password login is disabled; use "password": null to say so explicitly`);
                 }
             }
         }
@@ -2750,7 +2759,11 @@ class DeepJSONServer {
     }
     // User authentication
     authenticateUser(username, password) {
-        const user = this.accessData.users[username];
+        const users = this.accessData.users;
+        // Only a real entry is a user: users["__proto__"] or users["constructor"] are not.
+        const user = typeof username === 'string' && users && Object.hasOwn(users, username)
+            ? users[username]
+            : undefined;
 
         if (!user || !this.verifyPassword(password, user.password)) {
             throw new Error('Invalid credentials');
@@ -2759,30 +2772,14 @@ class DeepJSONServer {
         return user;
     }
 
-    /**
-     * Hashes a plaintext password for storage in access.json.
-     * Format: scrypt:<saltHex>:<hashHex>
-     */
+    // Hashes a plaintext password for access.json; see lib/password.js.
     hashPassword(password) {
-        const salt = crypto.randomBytes(16).toString('hex');
-        const hash = crypto.scryptSync(password, salt, 64).toString('hex');
-        return `scrypt:${salt}:${hash}`;
+        return passwordHash.hashPassword(password);
     }
 
-    /**
-     * Verifies a plaintext password against a scrypt hash produced by hashPassword().
-     */
+    // Checks a password against a stored hash; a malformed hash never matches.
     verifyPassword(password, stored) {
-        if (typeof stored !== 'string' || typeof password !== 'string') return false;
-
-        const parts = stored.split(':');
-        if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
-
-        const [, salt, hashHex] = parts;
-        const expected = Buffer.from(hashHex, 'hex');
-        const actual = crypto.scryptSync(password, salt, expected.length);
-
-        return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+        return passwordHash.verifyPassword(password, stored);
     }
 
     async readKeyData(req, key) {
