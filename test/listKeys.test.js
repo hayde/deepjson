@@ -13,6 +13,8 @@
 const assert = require('node:assert');
 const { test, describe } = require('node:test');
 const DeepJSONServer = require('../server');
+// Well-formed password hashes with no known password; these tests never log in.
+const HASH_A = `scrypt:${'a'.repeat(32)}:${'b'.repeat(128)}`;
 
 function harness({ keys = [], rules = [{ regex: '.*', crudx: '11111' }], config = {} } = {}) {
     const h = Object.create(DeepJSONServer.prototype);
@@ -154,7 +156,7 @@ describe('key_list_limit', () => {
                 jwt_secret: 'x'.repeat(40), port: 8080, index_depth: 2, key_list_limit
             };
             srv.accessData = {
-                users: { a: { id: 'a', password: 'scrypt:a:b', groups: ['g'] } },
+                users: { a: { id: 'a', password: HASH_A, groups: ['g'] } },
                 groups: { g: { rules: [{ regex: '.*', crudx: '11110' }] } }
             };
             return () => srv.validateConfig();

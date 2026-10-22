@@ -7,7 +7,7 @@ All notable changes to the DeepJSON server. The format follows
 Client connectors are versioned separately and move faster than the server; where a
 change affects what a client sees on the wire, it says so.
 
-## [Unreleased]
+## [1.2.0] / 2026-10-22
 
 ### Security
 
@@ -22,9 +22,29 @@ change affects what a client sees on the wire, it says so.
   name contains control characters or invalid Unicode is refused with `400`;
   existing keys stay reachable. `/cmd/move` returns `400` for a non-string `from` or
   `to`.
+- **A placeholder password hash accepted any password (#26).** A stored hash that
+  decoded to zero bytes, such as `scrypt:REPLACE:REPLACE` in
+  `examples/access.json.example`, matched every password, so a copied example file
+  gave anyone a superadmin login; a very short hash could be guessed in a few hundred
+  tries. A password now verifies only against a well-formed hash
+  (`scrypt:<salt>:<128 hex characters>`), and the server refuses to start, or to
+  reload `access.json`, while any user has a malformed one. `"password": null`
+  disables password login for an account used only through device authentication.
+  Login also no longer treats built-in names such as `__proto__` as users.
 
 ### Upgrade notes
 
+- **A server whose `access.json` holds a placeholder or malformed password hash will
+  not start** after this upgrade; the error names the user. This includes a hash
+  with a stray space or line break, which used to work. Check before upgrading:
+  `node -e 'const a=require(require("path").resolve(process.argv[1]));for(const[u,x]of Object.entries(a.users||{}))if(typeof x.password==="string"&&!/^scrypt:[0-9a-fA-F]{16,128}:[0-9a-fA-F]{128}$/.test(x.password))console.log("fix:",u)' /etc/deepjson/access.json`.
+  Give each listed user a real hash (`node bin/hash-password.js <password>`), or
+  `"password": null` if it should not log in with a password.
+- **If a server ran with a placeholder or malformed hash while reachable**, treat it
+  as compromised: anyone could have logged in as that user, and a token obtained that
+  way keeps renewing itself after this fix. Change `jwt_secret` in `dj.config` and
+  restart, which invalidates every issued token, then review the data and
+  `access.json` for changes.
 - **If the server was reachable by untrusted users before this release**, `dj.index`
   may hold forged lines, including some that only take effect on this version. Before
   the first start, check `grep -n '^{"v":2,' index/dj.index`: an index written by an
@@ -37,7 +57,7 @@ change affects what a client sees on the wire, it says so.
   containing `|`, a line break, or starting with `{` would be misread again, and the
   original issue returns with the old version.
 
-## [1.1.0] - 2026-10-13
+## [1.2.0] - 2026-10-13
 
 The first release since the initial commit, so it covers a lot. Two items need
 attention before upgrading — see **Upgrade notes** at the end.

@@ -1,5 +1,5 @@
 {
-  "_comment": "Users, groups and device credentials. Copy to the path named by access_file in dj.config. Passwords MUST be scrypt hashes: node bin/hash-password.js <password>",
+  "_comment": "Users, groups and device credentials. Copy to the path named by access_file in dj.config. Passwords MUST be scrypt hashes: node bin/hash-password.js <password>. The server refuses to start until every REPLACE placeholder is replaced; use \"password\": null for an account that only logs in through a device.",
 
   "users": {
     "admin": {

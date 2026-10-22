@@ -188,13 +188,17 @@ unencrypted.
 Path to `access.json`, holding users, groups, permissions and device
 credentials. It is validated at startup alongside `dj.config`: a user pointing at
 a group that does not exist, a rule with a regex that does not compile, or a
-password that is not a scrypt hash all prevent the server from starting.
+password that is not a well-formed scrypt hash (`scrypt:<salt>:<128 hex
+characters>`, as `node bin/hash-password.js <password>` produces) all prevent the
+server from starting. Set `"password": null` for an account that only logs in
+through device authentication; it then cannot log in with a password.
 
 The file contains password hashes and device secrets, so it should be `0640` at
 most, owned by the service account.
 
-**Read once at startup.** Adding a user or changing a password requires a
-restart.
+**Read at startup and on `POST /admin/reload-access`.** A reload is validated the
+same way; a file with a problem is refused and the previous access data stays in
+effect.
 
 ---
 
