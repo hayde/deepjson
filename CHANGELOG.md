@@ -7,6 +7,18 @@ All notable changes to the DeepJSON server. The format follows
 Client connectors are versioned separately and move faster than the server; where a
 change affects what a client sees on the wire, it says so.
 
+## [Unreleased]
+
+### Changed
+
+- **Script errors now report where they happened.** A failing script returns the
+  line and column inside your own script, for example `Script failed at line 2,
+  column 16: TypeError: ...`, and the `500` response gains `line` and `column`
+  fields. Script failures carry `code: "SCRIPT_ERROR"` and timeouts
+  `code: "SCRIPT_TIMEOUT"`, so a client can tell them from storage errors. The
+  message format changed from `Script failed: "<message>"`, so anything matching
+  that text needs updating.
+
 ## [1.2.0] / 2026-10-22
 
 ### Security
