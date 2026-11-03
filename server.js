@@ -2009,7 +2009,9 @@ class DeepJSONServer {
                     dryRun: true,
                     status: isDelete ? 204 : req.method === 'POST' ? 201 : 200,
                     exists,
-                    before: data?.value ?? null,
+                    // Only U/D was checked above, so the stored value needs R of its own;
+                    // a write-only user would otherwise read the key through a dry run.
+                    before: this.checkPermissions(user, key, 'R') ? data?.value ?? null : undefined,
                     after: isDelete ? null : response.data.value ?? null,
                     response: isDelete ? null : generatedKey
                         ? { ok: "success", key: generatedKey }
