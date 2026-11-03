@@ -332,7 +332,9 @@ curl -X PUT https://your-host/keys/reports.q3 -H "Authorization: Bearer $TOKEN" 
 ```
 
 `status` is what the real call would return (`201` for a new key, `204` for a delete) and
-`after` is `null` for a delete. File uploads are refused with `400` for now.
+`after` is `null` for a delete. `before` is left out when you have no read (R) permission on
+the key, so a write-only user cannot read it through a dry run. File uploads are refused with
+`400` for now.
 
 The script engine is configurable. The default is `wasm` (QuickJS compiled to WebAssembly), chosen for its strong isolation: even a bug in the JS engine itself cannot reach the host Node.js process.
 

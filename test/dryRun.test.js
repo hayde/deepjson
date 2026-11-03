@@ -38,8 +38,15 @@ describe('dry run', () => {
         Object.assign(dj, {
             config: { data_root: dataRoot, port: 0, jwt_secret: SECRET, index_depth: 2 },
             accessData: {
-                users: { admin: { id: 'admin', password: null, groups: ['superadmin'] } },
-                groups: { superadmin: { rules: [{ regex: '.*', crudx: '11111' }] } }
+                users: {
+                    admin: { id: 'admin', password: null, groups: ['superadmin'] },
+                    writer: { id: 'writer', password: null, groups: ['writeonly'] }
+                },
+                groups: {
+                    superadmin: { rules: [{ regex: '.*', crudx: '11111' }] },
+                    // U and D on drop.* but no R: the drop-box setup dry run must not leak from
+                    writeonly: { rules: [{ regex: '^drop\\.', crudx: '00110' }] }
+                }
             },
             index: new Map(),
             modificationCounter: 0,
@@ -54,6 +61,7 @@ describe('dry run', () => {
         srv = {
             base: `http://127.0.0.1:${port}`,
             auth: { Authorization: `Bearer ${jwt.sign({ id: 'admin', groups: ['superadmin'] }, SECRET, { expiresIn: '1h' })}` },
+            writerAuth: { Authorization: `Bearer ${jwt.sign({ id: 'writer', groups: ['writeonly'] }, SECRET, { expiresIn: '1h' })}` },
             async close() {
                 dj.server.closeAllConnections();
                 await new Promise((resolve) => dj.io.close(() => resolve()));
@@ -168,7 +176,25 @@ describe('dry run', () => {
         assert.strictEqual(dj.index.has('dr.file'), false);
     });
 
-    test('GET with the header is a normal GET', async () => {
+    test('a user without R does not see the stored value', async () => {
+        await send('POST', 'drop.box', JSON.stringify({ secret: 42 }), JSON_TYPE);
+        const asWriter = (method, body, headers) => fetch(`${srv.base}/keys/drop.box`, {
+            method, body, headers: { ...srv.writerAuth, ...DRY, ...headers }
+        });
+        assert.strictEqual((await fetch(`${srv.base}/keys/drop.box`, { headers: srv.writerAuth })).status, 403);
+
+        const put = await asWriter('PUT', JSON.stringify({ mine: 1 }), JSON_TYPE);
+        assert.strictEqual(put.status, 200);
+        const putBody = await put.json();
+        assert.strictEqual('before' in putBody, false);
+        assert.deepStrictEqual(putBody.after, { mine: 1 });
+
+        const del = await asWriter('DELETE');
+        assert.strictEqual(del.status, 200);
+        assert.strictEqual('before' in await del.json(), false);
+    });
+
+        test('GET with the header is a normal GET', async () => {
         await send('POST', 'dr.get', JSON.stringify({ g: 1 }), JSON_TYPE);
         const res = await send('GET', 'dr.get', undefined, DRY);
         assert.strictEqual(res.status, 200);
