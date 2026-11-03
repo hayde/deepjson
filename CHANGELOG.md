@@ -9,6 +9,14 @@ change affects what a client sees on the wire, it says so.
 
 ## [Unreleased]
 
+### Added
+
+- **Dry run for writes.** A `POST`, `PUT` or `DELETE` with the header
+  `X-DeepJSON-Dry-Run: true` runs authentication, permissions, preconditions and the
+  script, then returns `{ dryRun, status, exists, before, after, response }` instead
+  of writing. Nothing is stored and the index is untouched. Refusals keep their real
+  status. File uploads are not supported yet and give `400`.
+
 ### Changed
 
 - **Script errors now report where they happened.** A failing script returns the
