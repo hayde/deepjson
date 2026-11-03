@@ -236,6 +236,8 @@ returns is marked `rulesAreAdvisory`.
 
 Send JavaScript code with any request. Scripts execute in a sandboxed QuickJS WebAssembly environment. No access to Node.js APIs, the filesystem or the network. Memory and execution time are capped.
 
+Scripts support modern JavaScript (QuickJS, ES2020): `let`, `const`, arrow functions, template literals and so on.
+
 This is the mechanism behind [the core principle](#core-principle-compute-is-cheap-transport-is-not): the script runs where the data already sits, so a read-modify-write costs one round trip and moves no document.
 
 ```javascript
@@ -271,6 +273,20 @@ Scripts receive a context object with:
 | `response` | Set this to control what the client receives |
 | `abort` | Set this to refuse the operation: nothing is written and the request fails. `true` gives 412, a string becomes the message, `{ status, error }` sets both (status clamped to 400-599) |
 | `custom` | Persistent custom metadata on the record |
+
+When a script throws or fails to compile, the response carries the position inside your script
+(line 1 is the first line you sent), with `code` set to `SCRIPT_ERROR`. A script that runs past
+the time limit returns `SCRIPT_TIMEOUT` instead. `line` and `column` are left out when the
+engine reports no position inside your code.
+
+```json
+{
+  "error": "Script failed at line 2, column 16: TypeError: cannot read property 'bar' of undefined",
+  "code": "SCRIPT_ERROR",
+  "line": 2,
+  "column": 16
+}
+```
 
 Refusing an operation uses `abort`, which is also how arbitrary preconditions are
 expressed — any boolean logic over `data`, `custom`, `body` or `user`, with no

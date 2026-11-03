@@ -79,7 +79,7 @@ describe('functional correctness', () => {
     test('thrown errors inside the script surface as a wrapped "Script failed" error', async () => {
         await assert.rejects(
             run('throw new Error("boom");', {}),
-            /Script failed: "boom"/
+            /Script failed at line 1, column 16: Error: boom/
         );
     });
 
@@ -97,6 +97,44 @@ describe('functional correctness', () => {
     });
 });
 
+describe('error positions', () => {
+    test('a runtime error on line 1 reports line and column', async () => {
+        await assert.rejects(run('null.bar;', {}), err => {
+            assert.strictEqual(err.code, 'SCRIPT_ERROR');
+            assert.strictEqual(err.line, 1);
+            assert.strictEqual(err.column, 5);
+            assert.match(err.message, /^Script failed at line 1, column 5: TypeError: /);
+            return true;
+        });
+    });
+
+    test('an error on a later line reports that line, not the wrapper offset', async () => {
+        await assert.rejects(run('var a = 1;\n\nvar o;\ndata = o.bar;', {}), err => {
+            assert.strictEqual(err.line, 4);
+            assert.strictEqual(err.column, 9);
+            return true;
+        });
+    });
+
+    test('a syntax error reports its position', async () => {
+        await assert.rejects(run('var a = 1;\nvar x = ;', {}), err => {
+            assert.strictEqual(err.code, 'SCRIPT_ERROR');
+            assert.strictEqual(err.line, 2);
+            assert.match(err.message, /SyntaxError/);
+            return true;
+        });
+    });
+
+    test('an error the engine places in the wrapper gets no position', async () => {
+        await assert.rejects(run('var x = {', {}), err => {
+            assert.strictEqual(err.code, 'SCRIPT_ERROR');
+            assert.strictEqual(err.line, undefined);
+            assert.doesNotMatch(err.message, /at line/);
+            return true;
+        });
+    });
+});
+
 describe('timeout enforcement', () => {
     test('a script within the time limit completes normally', async () => {
         const result = await run('data = "fast";', {}, { script_execution_time_limit: 300 });
@@ -106,7 +144,7 @@ describe('timeout enforcement', () => {
     test('an infinite loop is aborted at the configured timeout, not hung forever', async () => {
         await assert.rejects(
             run('while(true) {}', {}, { script_execution_time_limit: 200 }),
-            /Script exceeded maximum execution time/
+            err => err.code === 'SCRIPT_TIMEOUT' && /Script exceeded maximum execution time/.test(err.message)
         );
     });
 });

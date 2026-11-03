@@ -1619,10 +1619,16 @@ class DeepJSONServer {
             return await engine.run(code, context, limits);
         } catch (err) {
             if (err.code === 'TIMEOUT') {
-                throw new Error('Script exceeded maximum execution time');
-            } else {
-                throw new Error(`Script failed: "${err.message}"`);
+                const timeout = new Error('Script exceeded maximum execution time');
+                timeout.code = 'SCRIPT_TIMEOUT';
+                throw timeout;
             }
+            const where = err.line ? ` at line ${err.line}, column ${err.column}` : '';
+            const failure = new Error(`Script failed${where}: ${err.name}: ${err.message}`);
+            failure.code = 'SCRIPT_ERROR';
+            failure.line = err.line;
+            failure.column = err.column;
+            throw failure;
         }
     }
     /**
@@ -2056,7 +2062,8 @@ class DeepJSONServer {
             const status = err.code === 'ENOENT' ? 404 : 500;
             return res.status(status).json({
                 error: err.message,
-                code: err.code
+                code: err.code,
+                ...(err.line && { line: err.line, column: err.column })
             });
         }
     }
