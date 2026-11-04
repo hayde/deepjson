@@ -1,76 +1,23 @@
 # DeepJSON
 
-A JSON document database with built-in server-side scripting, real-time synchronization and binary file storage. One server replaces what typically takes a database, a file store, a scripting layer and a WebSocket service.
+**The agent database. One server instead of five services.**
 
-See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, including upgrade notes. The running server reports its own version at `GET /version`.
-
-## Core principle: compute is cheap, transport is not
-
-Every feature in DeepJSON follows from one assumption: **CPU time on the server
-costs less than moving data to the client and back.** So manipulation belongs
-next to the data, and a response should carry the answer rather than the material
-needed to work it out.
-
-The difference is not marginal. Attaching four fields of metadata to a stored
-document, the conventional way, means fetching the document, changing it
-locally and sending it back — for a 222 MB document that is roughly 444 MB over
-the wire and two round trips. The same operation as a server-side script is about
-150 bytes up and an acknowledgement down:
-
-```javascript
-await dj.put('docs.' + hash, meta, `
-  if (!custom) custom = {};
-  custom.meta = body;
-  response = { ok: true };
-`);
-```
-
-The document never leaves the server. The script runs where the data already is,
-and `response` controls what comes back — so the client receives the result, not
-the document.
-
-This is why the server looks the way it does:
-
-| Feature | What it avoids transporting |
-|---------|-----------------------------|
-| Server-side scripting | The document, in both directions, for every read-modify-write |
-| `response` separate from `data` | The whole stored value when the client only needs an answer |
-| `abort` and conditional requests | A round trip to discover the write should not happen |
-| On-the-fly image transformation | The full-resolution original, when a 400px thumbnail was wanted |
-| Real-time channels | Repeated polling for data that has not changed |
-| Wildcard key generation | A round trip to ask which identifier is free |
-
-The practical consequence for anyone building on it: if you find yourself reading
-a document in order to decide something and then writing it back, that logic
-belongs in a script. One round trip, no payload, and the operation is serialized
-against other writers for free.
+Data, files, scripts, real-time channels and permissions, all behind one HTTP API. No tables to define and nothing to wire together. Your agent sends the logic and it runs right next to the data.
 
 ## Why DeepJSON
 
-Most databases only store data. Everything else like scripting, file handling, real-time sync and access control must be handled separately. DeepJSON handles all of it in a single process with two config files.
+Most databases only store data. Scripting, files, real-time sync and access control have to come from somewhere else, and every extra service is one more thing for an agent or a developer to learn, connect and secure. DeepJSON handles all of it in a single process with two config files.
 
-Most startups start with a database and quickly add an object store for files, an auth service and a cache or real-time layer. DeepJSON is a single process that covers all of them.
-
-Security is handled natively. Authentication, permissions, token renewal and password hashing are all built into the server. With separate services, developers spend time wiring up auth layers, managing API keys between services and securing inter-service communication. With DeepJSON, security works out of the box and developers can focus on building features.
-
-- **Server-side scripting**: send JavaScript alongside your request, executed in a sandboxed WebAssembly environment (QuickJS). No Lambda functions, no separate compute layer. The script runs against your data and returns the result in one round trip.
+- **Easy for an agent to learn**: JSON over plain HTTP from any language, with no schema, migrations or ORM. The server is small enough to read when the docs leave a question open.
+- **Logic runs where the data is**: send JavaScript alongside your request, executed in a sandboxed WebAssembly environment (QuickJS). No Lambda functions, no separate compute layer. The script runs against your data and returns the result in one round trip.
+- **Writes an agent can check**: preview any write with a [dry run](#dry-run), get script errors with the line and column, and use [`If-Match`](#conditional-requests) so a write based on old data is refused instead of overwriting newer data.
+- **Agents coordinate through it**: writes to one key happen one at a time, so agents can share work and status with nothing but keys and scripts.
+- **CRUDX permissions**: regex-based access control, so each agent or user gets only the keys it needs. The X stands for eXecute: script execution is a separate permission, not bundled with read/write. `GET /whoami?keys=a,b` answers what a caller may do before it tries.
+- **Binary file storage**: upload images, PDFs and documents as first-class keys, next to the data they belong to. Images are served with on-the-fly resizing, cropping and format conversion.
 - **Real-time sync**: built-in WebSocket channels with master/client sessions. No need for a separate pub/sub service.
-- **Binary file storage**: upload images, PDFs and documents as first-class keys. Images are served with on-the-fly resizing, cropping and format conversion.
-- **CRUDX permissions**: regex-based access control. The X stands for eXecute: script execution is a separate permission, not bundled with read/write.
-- **Zero-dependency connector**: the official [JavaScript client](https://github.com/hayde/deepjson-js-connector) runs in Node.js and the browser with no runtime dependencies. One `<script>` tag, no build step, no CDN.
+- **Security built in**: authentication, permissions, token renewal and password hashing are part of the server, so there are no auth layers to wire up, no API keys to manage between services and no inter-service communication to secure.
 - **Sliding session tokens**: every authenticated response silently renews the JWT. An active client never expires.
-
-## When to use DeepJSON
-
-DeepJSON works well as:
-
-- A **backend for web and mobile apps** that need JSON storage, file uploads and real-time features without managing multiple services
-- A **prototyping and rapid development database**: one server, one config file, full CRUD + scripting + sync out of the box
-- A **startup backend** that replaces your database, file store, scripting layer and WebSocket service with a single process. Fewer moving parts, lower infra cost, faster time to market
-- An **IoT data store** with HMAC device authentication and IP whitelisting
-- A **collaborative application backend** with real-time channels for live editing, dashboards or multiplayer features
-- A **self-hosted alternative** to Firebase, Supabase or MongoDB Atlas when you want full control over your data and infrastructure
-- A **document and file management backend** with content-addressable storage and on-the-fly image processing
+- **Zero-dependency connector**: the official [JavaScript client](https://github.com/hayde/deepjson-js-connector) runs in Node.js and the browser with no runtime dependencies. One `<script>` tag, no build step, no CDN. A [Python connector](https://pypi.org/project/deepjson-py-connector/) is also available.
 
 ## Quick Start
 
@@ -126,9 +73,36 @@ node bin/hash-password.js your-secure-password
 node main.js /etc/deepjson/dj.config
 ```
 
-### 4. Connect
+The running server reports its own version at `GET /version`. See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, including upgrade notes.
 
-Install the JavaScript connector:
+### 4. Give your agent its own account
+
+Do not hand an agent your admin login. This rule gives it create, read, update and execute on `acme.*`, no delete and no access to anything else. Add it to `access.json`, then restart or call `POST /admin/reload-access` as an admin:
+
+```json
+{
+  "users": {
+    "agent": { "id": "agent", "password": "scrypt:<salt>:<hash>", "groups": ["agents"] }
+  },
+  "groups": {
+    "agents": { "rules": [{ "regex": "^acme\\.", "crudx": "11101" }] }
+  }
+}
+```
+
+### 5. Connect
+
+Give your agent the server URL, its login and this README. It logs in over plain HTTP and sends the token with every request:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"agent","password":"your-agent-password"}' | jq -r .token)
+
+curl http://localhost:3000/whoami -H "Authorization: Bearer $TOKEN"
+```
+
+In your own code, install the JavaScript connector:
 
 ```bash
 npm install deepjson-connector
@@ -161,76 +135,165 @@ A [Python connector](https://pypi.org/project/deepjson-py-connector/) is also av
 pip install deepjson-py-connector
 ```
 
-## Features
+## Try it: a job queue in five requests
 
-### Authentication
+No queue service is needed. The script takes the next pending job and marks it in the same write, so two workers can never get the same job.
 
-**JWT tokens**: login with username/password, receive a signed JWT. Every authenticated response includes a renewed token in the `X-Renewed-Token` header, automatically picked up by the connector. An active session never expires.
+```bash
+# 1. Log in
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"agent","password":"your-agent-password"}' | jq -r .token)
 
-**HMAC device authentication**: for IoT devices and automated systems. Authenticate with a device ID, user, timestamp and HMAC-SHA256 signature. Supports IP whitelisting and device-specific user allowlists.
+# 2. Create the queue
+curl -X POST http://localhost:3000/keys/acme.jobs \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '[{"id":1,"status":"pending"},{"id":2,"status":"pending"}]'
 
+# The script: take the next pending job
+TAKE_NEXT='javascript:
+const job = data.find(j => j.status === "pending");
+if (!job) { abort = { status: 404, error: "queue empty" }; }
+else { job.status = "processing"; job.worker = body.worker; response = job; }
+javascript! {"worker":"agent-1"}'
+
+# 3. Preview it: nothing is written
+curl -X PUT http://localhost:3000/keys/acme.jobs \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' \
+  -H 'X-DeepJSON-Dry-Run: true' -d "$TAKE_NEXT"
+
+# 4. Run it for real
+curl -X PUT http://localhost:3000/keys/acme.jobs \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' -d "$TAKE_NEXT"
+
+# 5. Read the result
+curl http://localhost:3000/keys/acme.jobs -H "Authorization: Bearer $TOKEN"
 ```
-X-Device-Auth: {deviceId}:{timestamp}:{user}:{signature}
-```
 
-**Password security**: passwords are stored as scrypt hashes (`scrypt:<salt>:<hash>`), verified with constant-time comparison. Plaintext passwords are never stored. A stored value that is not a well-formed hash never matches, and stops the server at startup; `"password": null` disables password login for an account used only through device authentication.
-
-**Live access changes**: `access.json` is read at startup and on `POST /admin/reload-access`, so adding a user or changing a permission needs no restart. A reload is all-or-nothing: the new file must parse and validate before it replaces anything, otherwise the running server keeps the access data it already had. Removing a user takes effect on their next request, even if they still hold a valid token.
-
-### CRUDX Access Control
-
-Permissions are defined per group with regex patterns matching key names. Each rule carries a 5-character CRUDX string:
-
-| Position | Permission | Description |
-|----------|-----------|-------------|
-| 0 | **C**reate | POST new keys |
-| 1 | **R**ead | GET existing keys |
-| 2 | **U**pdate | PUT to existing keys |
-| 3 | **D**elete | DELETE keys |
-| 4 | e**X**ecute | Run server-side scripts |
-
-Example `access.json`:
+The preview in step 3 answers:
 
 ```json
 {
-  "users": {
-    "alice": {
-      "id": "alice",
-      "password": "scrypt:<salt>:<hash>",
-      "email": "alice@example.com",
-      "groups": ["editors"]
-    }
-  },
-  "groups": {
-    "editors": {
-      "rules": [
-        { "regex": "^public\\..*", "crudx": "11110" },
-        { "regex": "^drafts\\.alice\\..*", "crudx": "11111" }
-      ]
-    }
-  }
+  "dryRun": true,
+  "status": 200,
+  "exists": true,
+  "before": [{ "id": 1, "status": "pending" }, { "id": 2, "status": "pending" }],
+  "after": [{ "id": 1, "status": "processing", "worker": "agent-1" }, { "id": 2, "status": "pending" }],
+  "response": { "id": 1, "status": "processing", "worker": "agent-1" }
 }
 ```
 
-Rules are evaluated in order: the **last matching rule wins**. This allows patterns like "access everything, except this subset."
+A mistake in a script comes back in a form an agent can act on:
 
-Within one group that ordering is deliberate and safe to rely on. Across groups it is
-not: the groups are walked in the order the user lists them, so adding a group to a
-user can revoke access they already had, and swapping two entries changes the
-outcome. The server reports this at startup, naming the user, the count and an
-example:
-
-```
-Permission warning: user "alice" is denied C on 2 keys, U on 2 keys, D on 2 keys,
-X on 2 keys by a group listed after the one that granted it. Example:
-"de.gamma.doc.1" - C granted by group "worker" rule "^de\..*", then denied by
-group "readonly" rule "^de\.gamma\..*".
+```json
+{
+  "error": "Script failed at line 2, column 16: TypeError: cannot read property 'bar' of undefined",
+  "code": "SCRIPT_ERROR",
+  "line": 2,
+  "column": 16
+}
 ```
 
-The within-group idiom above is not reported, since it is intentional. For an
-authoritative answer on any key, use `GET /whoami?keys=a,b` — it resolves
-permissions through the same code that enforces them, which is why the rule list it
-returns is marked `rulesAreAdvisory`.
+This pattern runs in production: a pipeline of about eight workers coordinates through DeepJSON alone, and one script hands out the next document from a single array. Every operation on that array handles the whole document, so see [when not to use DeepJSON](#when-not-to-use-deepjson) before growing one much further.
+
+## What an agent should know
+
+- **`POST` creates and `PUT` updates.** `POST` on an existing key gives `400` unless you send `x-override-existing`. `PUT` on a missing key gives `404`.
+- **A script is sent as `text/plain`:** `javascript: <code> javascript! <json>`. The JSON arrives as `body`, and scripts support modern JavaScript.
+- **A write stores whatever `data` holds when the script ends.** A script that creates a key must assign `data`, or the request fails with `400`.
+- **`response` is what comes back.** Set it to return only the answer. Set `abort` to refuse the operation.
+- **A script sees only its own key.** It cannot read other keys, the filesystem or the network.
+- **To run a script without writing,** send it as a `POST` with `x-method-override: GET`.
+- **Keep the newest token.** Each authenticated response carries a renewed one in `X-Renewed-Token`, and a token expires after an hour without renewal. `GET /version` works as a heartbeat.
+
+## Core principle: compute is cheap, transport is not
+
+Every feature in DeepJSON follows from one assumption: **CPU time on the server
+costs less than moving data to the client and back.** So manipulation belongs
+next to the data, and a response should carry the answer rather than the material
+needed to work it out.
+
+The difference is not marginal. Attaching four fields of metadata to a stored
+document, the conventional way, means fetching the document, changing it
+locally and sending it back — for a 222 MB document that is roughly 444 MB over
+the wire and two round trips. The same operation as a server-side script is about
+150 bytes up and an acknowledgement down:
+
+```javascript
+await dj.put('docs.' + hash, meta, `
+  if (!custom) custom = {};
+  custom.meta = body;
+  response = { ok: true };
+`);
+```
+
+The document never leaves the server. The script runs where the data already is,
+and `response` controls what comes back — so the client receives the result, not
+the document.
+
+This is why the server looks the way it does:
+
+| Feature | What it avoids transporting |
+|---------|-----------------------------|
+| Server-side scripting | The document, in both directions, for every read-modify-write |
+| `response` separate from `data` | The whole stored value when the client only needs an answer |
+| `abort` and conditional requests | A round trip to discover the write should not happen |
+| On-the-fly image transformation | The full-resolution original, when a 400px thumbnail was wanted |
+| Real-time channels | Repeated polling for data that has not changed |
+| Wildcard key generation | A round trip to ask which identifier is free |
+
+The practical consequence for anyone building on it: if you find yourself reading
+a document in order to decide something and then writing it back, that logic
+belongs in a script. One round trip, no payload, and the operation is serialized
+against other writers for free.
+
+## When to use DeepJSON
+
+DeepJSON works well as:
+
+- A **shared backend for AI agents**: one place to store state, run logic and coordinate work, usable from any language that can send HTTP
+- A **backend for web and mobile apps** that need JSON storage, file uploads and real-time features without managing multiple services
+- A **prototyping and rapid development database**: one server, one config file, full CRUD + scripting + sync out of the box
+- A **startup backend** that replaces your database, file store, scripting layer and WebSocket service with a single process. Fewer moving parts, lower infra cost, faster time to market
+- An **IoT data store** with HMAC device authentication and IP whitelisting
+- A **collaborative application backend** with real-time channels for live editing, dashboards or multiplayer features
+- A **self-hosted alternative** to Firebase, Supabase or MongoDB Atlas when you want full control over your data and infrastructure
+- A **document and file management backend** with content-addressable storage and on-the-fly image processing
+
+## When not to use DeepJSON
+
+Look elsewhere, or pair DeepJSON with something else, when you need:
+
+- **Vector or semantic search.**
+- **Queries on document contents across many keys.** There is no value index, and joins and analytics are out of scope. See [Querying](#querying) for what works instead.
+- **Many writers on one very large key.** Writers to one key take turns, and each write handles the whole document. Split large collections into more keys before they get that far.
+
+## What is not there yet
+
+- **No undo.** A successful `PUT` or `DELETE` replaces or removes the value, and no earlier version is kept. Preview risky writes with a dry run and [keep backups](#backup-and-restore).
+- **No short-lived or per-task tokens.** An account's rights apply to all its tokens, and a token keeps renewing while it is used. Give each agent an account with only the rights it needs.
+- **No MCP server.** Agents use the HTTP API or a [connector](#connectors).
+
+## Comparison with Other Databases
+
+> 🟢 Built-in / native &nbsp;&nbsp; 🟡 Partial / separate service &nbsp;&nbsp; 🔴 Not available
+
+| Feature | DeepJSON | Firebase | MongoDB | Redis | Supabase |
+|---------|:--------:|:--------:|:-------:|:-----:|:--------:|
+| JSON document storage | 🟢 Native | 🟢 Native | 🟢 BSON | 🟢 Native | 🟡 JSONB |
+| Server-side scripting | 🟢 WASM | 🟡 Separate | 🟡 Deprecated | 🟡 Lua | 🟡 Separate |
+| Real-time sync | 🟢 WebSocket | 🟢 Built-in | 🟡 Streams | 🟡 Pub/Sub | 🟢 Built-in |
+| Binary file storage | 🟢 Same API | 🟡 Separate | 🟡 GridFS | 🔴 | 🟡 Separate |
+| Image processing | 🟢 Built-in | 🟡 Extension | 🔴 | 🔴 | 🟡 Storage |
+| Self-hosted | 🟢 | 🔴 | 🟢 | 🟢 | 🟢 |
+| Zero-dependency client | 🟢 | 🔴 | 🔴 | 🔴 | 🔴 |
+| HMAC device auth | 🟢 | 🔴 | 🔴 | 🔴 | 🔴 |
+| Sliding token renewal | 🟢 Auto | 🟡 Managed | 🔴 | 🔴 | 🟡 Managed |
+| Permission model | CRUDX | Rules | RBAC | ACL | RLS |
+| Setup complexity | 1 config | Console | Standalone | Config | Multi-svc |
+| Horizontal scaling | Sharded | Managed | Sharding | Cluster | Managed |
+
+## Features
 
 ### Server-Side Scripting
 
@@ -370,154 +433,6 @@ A body that cannot be read is refused rather than stored: malformed JSON gives
 other content type, or with none, gives `415`. These refusals are JSON, like every
 other error from `/keys/:key`.
 
-### Real-Time Channels
-
-WebSocket-based sessions with a master/client model for live collaboration.
-
-```javascript
-const { SyncConnector } = require('deepjson-connector');
-
-const sync = new SyncConnector({ baseURL: 'http://localhost:3000' });
-await sync.login('alice', 'password');
-
-// Create a session (you become the master)
-const channelId = await sync.createSession();
-// Share channelId with collaborators
-
-// Others join with the channel ID
-await sync.joinSession(channelId);
-
-// Send messages to all participants
-sync.send('cursor-move', { x: 100, y: 200, user: 'alice' });
-
-// Receive messages
-sync.on('cursor-move', (data) => {
-  renderCursor(data.user, data.x, data.y);
-});
-```
-
-Session features:
-- Master/client roles: the master's disconnect ends the session
-- Configurable max clients per session
-- Duplicate connection prevention
-- Automatic reconnection with token refresh
-- Empty session TTL cleanup
-
-### File Storage and Image Processing
-
-Upload binary files (images, PDFs, documents) and retrieve them with optional on-the-fly transformations.
-
-```javascript
-// Upload
-await dj.uploadFile('photos.vacation.sunset', file);
-
-// Download original
-const original = await dj.setBinary(true).get('photos.vacation.sunset');
-
-// Download resized (query parameters)
-// GET /keys/photos.vacation.sunset?binary&width=400&height=300&fit=cover&format=webp&quality=80
-```
-
-Supported image operations:
-
-| Parameter | Values | Description |
-|-----------|--------|-------------|
-| `width` | pixels | Target width |
-| `height` | pixels | Target height |
-| `fit` | contain, cover, fill, inside, outside | Resize strategy |
-| `alignX` | left, center, right | Horizontal crop position |
-| `alignY` | top, center, bottom | Vertical crop position |
-| `format` | jpeg, png | Output format conversion |
-| `quality` | 1-100 | JPEG quality |
-| `allowEnlarge` | true/false | Allow upscaling |
-
-Images are automatically rotated based on EXIF orientation data.
-
-### Wildcard Key Generation
-
-Automatically generate unique keys on POST using wildcard patterns:
-
-```javascript
-// Auto-incrementing: creates tickets.1, tickets.2, tickets.3, ...
-await dj.post('tickets.*{type:inc}', { title: 'Bug report' });
-
-// Random UUID: creates logs.<uuid>
-await dj.post('logs.*{type:random}', { event: 'user_signup' });
-```
-
-### Key Operations
-
-**Key names** may contain any character except control characters (U+0000 to
-U+001F and U+007F, such as line breaks or tabs) and invalid Unicode; creating such a
-key is refused with `400`. Keys that already exist stay reachable.
-
-**Move/Rename** with full permission checks and key history tracking:
-
-```javascript
-await dj.move('drafts.article-1', 'published.article-1');
-```
-
-The move operation verifies delete permission on the source, create/update permission on the target, supports wildcard destinations and records the move in the key's metadata history.
-
-### Querying
-
-DeepJSON has no value-based query engine. There are two patterns instead, and
-between them they cover most access patterns without one — but it is worth knowing
-the limit before you design around it.
-
-**1. The key hierarchy is the index.** Keys are dotted paths, and the whole
-keyspace lives in memory, so a pattern over key *names* is answered without
-reading a single document:
-
-```javascript
-// every document for one client site
-const { keys, total } = await dj.listKeys('^de\\.acme\\.berlin\\.docs\\.');
-
-// just the count, no keys transferred
-const { total } = await dj.listKeys('^de\\.acme\\.', { count: true });
-
-// one page at a time
-const page = await dj.listKeys('^de\\.', { limit: 100, offset: 200 });
-```
-
-| Option | Meaning |
-|--------|---------|
-| `keys` | Regular expression matched against the key name |
-| `limit`, `offset` | Page through the result. `total` always reports the full match |
-| `count` | Return only `total`, with no key list |
-
-So encode in the key what you will want to search by — client, site, type, date —
-and lookups stay index-only. `GET /cmd/keys/` and `GET /admin/keys` both work this
-way, and `key_list_limit` in `dj.config` lets an operator cap any single listing.
-
-**2. Model a collection as one document.** When a set of records is read and
-written together, store them under one key and query inside a script. The whole
-operation is one round trip, and it is serialized against other writers for free:
-
-```javascript
-// reserve a block of ids from a client record, server-side
-const result = await dj.put('clients', { kNumber: 'K-17', count: 20 }, `
-  var client = data.find(function (c) { return c.kNumber === body.kNumber; });
-  if (!client) { abort = { status: 404, error: 'unknown client' }; }
-  else {
-    var start = client.docIdCounter || 1;
-    client.docIdCounter = start + body.count;
-    response = { start: start, end: start + body.count - 1 };
-  }
-`);
-```
-
-Nothing but the request and `{ start, end }` crosses the network. This is the
-[core principle](#core-principle-compute-is-cheap-transport-is-not) applied to
-reads as much as writes.
-
-**What this does not do.** There is no index on document contents, so "every
-document where `status = 'pending'`" means reading every candidate document. A
-script cannot help: it receives its own document and nothing else, by design. If
-an access pattern needs selectivity on a field, the options today are to encode
-that field in the key, or to keep the collection in one document and search it
-inside a script.
-
 ### Conditional Requests
 
 Every response for a key carries an `ETag` — the document's version. Send it back
@@ -578,6 +493,237 @@ Notes:
 - Input is read leniently — unquoted tags and a `W/` prefix are accepted, since
   clients get those wrong often enough that refusing is unhelpful. What the server
   emits is always a correctly quoted tag.
+
+### CRUDX Access Control
+
+Permissions are defined per group with regex patterns matching key names. Each rule carries a 5-character CRUDX string:
+
+| Position | Permission | Description |
+|----------|-----------|-------------|
+| 0 | **C**reate | POST new keys |
+| 1 | **R**ead | GET existing keys |
+| 2 | **U**pdate | PUT to existing keys |
+| 3 | **D**elete | DELETE keys |
+| 4 | e**X**ecute | Run server-side scripts |
+
+Example `access.json`:
+
+```json
+{
+  "users": {
+    "alice": {
+      "id": "alice",
+      "password": "scrypt:<salt>:<hash>",
+      "email": "alice@example.com",
+      "groups": ["editors"]
+    }
+  },
+  "groups": {
+    "editors": {
+      "rules": [
+        { "regex": "^public\\..*", "crudx": "11110" },
+        { "regex": "^drafts\\.alice\\..*", "crudx": "11111" }
+      ]
+    }
+  }
+}
+```
+
+Rules are evaluated in order: the **last matching rule wins**. This allows patterns like "access everything, except this subset."
+
+Within one group that ordering is deliberate and safe to rely on. Across groups it is
+not: the groups are walked in the order the user lists them, so adding a group to a
+user can revoke access they already had, and swapping two entries changes the
+outcome. The server reports this at startup, naming the user, the count and an
+example:
+
+```
+Permission warning: user "alice" is denied C on 2 keys, U on 2 keys, D on 2 keys,
+X on 2 keys by a group listed after the one that granted it. Example:
+"acme.docs.1" - C granted by group "worker" rule "^acme\..*", then denied by
+group "readonly" rule "^acme\.docs\..*".
+```
+
+The within-group idiom above is not reported, since it is intentional. For an
+authoritative answer on any key, use `GET /whoami?keys=a,b` — it resolves
+permissions through the same code that enforces them, which is why the rule list it
+returns is marked `rulesAreAdvisory`.
+
+### Authentication
+
+**JWT tokens**: login with username/password, receive a signed JWT. Every authenticated response includes a renewed token in the `X-Renewed-Token` header, automatically picked up by the connector. An active session never expires.
+
+**HMAC device authentication**: for IoT devices and automated systems. Authenticate with a device ID, user, timestamp and HMAC-SHA256 signature. Supports IP whitelisting and device-specific user allowlists.
+
+```
+X-Device-Auth: {deviceId}:{timestamp}:{user}:{signature}
+```
+
+**Password security**: passwords are stored as scrypt hashes (`scrypt:<salt>:<hash>`), verified with constant-time comparison. Plaintext passwords are never stored. A stored value that is not a well-formed hash never matches, and stops the server at startup; `"password": null` disables password login for an account used only through device authentication.
+
+**Live access changes**: `access.json` is read at startup and on `POST /admin/reload-access`, so adding a user or changing a permission needs no restart. A reload is all-or-nothing: the new file must parse and validate before it replaces anything, otherwise the running server keeps the access data it already had. Removing a user takes effect on their next request, even if they still hold a valid token.
+
+### Identity Endpoints
+
+Both sit behind authentication, so they double as a connectivity check and token renewal.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /version` | Server version (from package.json). Lightweight heartbeat. |
+| `GET /whoami` | Caller's identity, groups, admin status and rule list |
+| `GET /whoami?keys=a,b` | Same, plus resolved CRUDX permissions for the requested keys |
+
+### Querying
+
+DeepJSON has no value-based query engine. There are two patterns instead, and
+between them they cover most access patterns without one — but it is worth knowing
+the limit before you design around it.
+
+**1. The key hierarchy is the index.** Keys are dotted paths, and the whole
+keyspace lives in memory, so a pattern over key *names* is answered without
+reading a single document:
+
+```javascript
+// every document for one client site
+const { keys, total } = await dj.listKeys('^acme\\.berlin\\.docs\\.');
+
+// just the count, no keys transferred
+const { total } = await dj.listKeys('^acme\\.', { count: true });
+
+// one page at a time
+const page = await dj.listKeys('^acme\\.', { limit: 100, offset: 200 });
+```
+
+| Option | Meaning |
+|--------|---------|
+| `keys` | Regular expression matched against the key name |
+| `limit`, `offset` | Page through the result. `total` always reports the full match |
+| `count` | Return only `total`, with no key list |
+
+So encode in the key what you will want to search by — client, site, type, date —
+and lookups stay index-only. `GET /cmd/keys/` and `GET /admin/keys` both work this
+way, and `key_list_limit` in `dj.config` lets an operator cap any single listing.
+
+**2. Model a collection as one document.** When a set of records is read and
+written together, store them under one key and query inside a script. The whole
+operation is one round trip, and it is serialized against other writers for free:
+
+```javascript
+// reserve a block of ids from a client record, server-side
+const result = await dj.put('clients', { kNumber: 'K-17', count: 20 }, `
+  var client = data.find(function (c) { return c.kNumber === body.kNumber; });
+  if (!client) { abort = { status: 404, error: 'unknown client' }; }
+  else {
+    var start = client.docIdCounter || 1;
+    client.docIdCounter = start + body.count;
+    response = { start: start, end: start + body.count - 1 };
+  }
+`);
+```
+
+Nothing but the request and `{ start, end }` crosses the network. This is the
+[core principle](#core-principle-compute-is-cheap-transport-is-not) applied to
+reads as much as writes.
+
+**What this does not do.** There is no index on document contents, so "every
+document where `status = 'pending'`" means reading every candidate document. A
+script cannot help: it receives its own document and nothing else, by design. If
+an access pattern needs selectivity on a field, the options today are to encode
+that field in the key, or to keep the collection in one document and search it
+inside a script.
+
+### Key Operations
+
+**Key names** may contain any character except control characters (U+0000 to
+U+001F and U+007F, such as line breaks or tabs) and invalid Unicode; creating such a
+key is refused with `400`. Keys that already exist stay reachable.
+
+**Move/Rename** with full permission checks and key history tracking:
+
+```javascript
+await dj.move('drafts.article-1', 'published.article-1');
+```
+
+The move operation verifies delete permission on the source, create/update permission on the target, supports wildcard destinations and records the move in the key's metadata history.
+
+### Wildcard Key Generation
+
+Automatically generate unique keys on POST using wildcard patterns:
+
+```javascript
+// Auto-incrementing: creates tickets.1, tickets.2, tickets.3, ...
+await dj.post('tickets.*{type:inc}', { title: 'Bug report' });
+
+// Random UUID: creates logs.<uuid>
+await dj.post('logs.*{type:random}', { event: 'user_signup' });
+```
+
+### File Storage and Image Processing
+
+A file is a key like any other, so an agent can keep a document next to its metadata and use the same API and permissions for both.
+
+Upload binary files (images, PDFs, documents) and retrieve them with optional on-the-fly transformations.
+
+```javascript
+// Upload
+await dj.uploadFile('photos.vacation.sunset', file);
+
+// Download original
+const original = await dj.setBinary(true).get('photos.vacation.sunset');
+
+// Download resized (query parameters)
+// GET /keys/photos.vacation.sunset?binary&width=400&height=300&fit=cover&format=webp&quality=80
+```
+
+Supported image operations:
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `width` | pixels | Target width |
+| `height` | pixels | Target height |
+| `fit` | contain, cover, fill, inside, outside | Resize strategy |
+| `alignX` | left, center, right | Horizontal crop position |
+| `alignY` | top, center, bottom | Vertical crop position |
+| `format` | jpeg, png | Output format conversion |
+| `quality` | 1-100 | JPEG quality |
+| `allowEnlarge` | true/false | Allow upscaling |
+
+Images are automatically rotated based on EXIF orientation data.
+
+### Real-Time Channels
+
+Channels let agents, apps and people exchange live messages without polling.
+
+WebSocket-based sessions with a master/client model for live collaboration.
+
+```javascript
+const { SyncConnector } = require('deepjson-connector');
+
+const sync = new SyncConnector({ baseURL: 'http://localhost:3000' });
+await sync.login('alice', 'password');
+
+// Create a session (you become the master)
+const channelId = await sync.createSession();
+// Share channelId with collaborators
+
+// Others join with the channel ID
+await sync.joinSession(channelId);
+
+// Send messages to all participants
+sync.send('cursor-move', { x: 100, y: 200, user: 'alice' });
+
+// Receive messages
+sync.on('cursor-move', (data) => {
+  renderCursor(data.user, data.x, data.y);
+});
+```
+
+Session features:
+- Master/client roles: the master's disconnect ends the session
+- Configurable max clients per session
+- Duplicate connection prevention
+- Automatic reconnection with token refresh
+- Empty session TTL cleanup
 
 ### Durability
 
@@ -649,16 +795,6 @@ Admin routes require membership in the `admin` or `superadmin` group.
 | `POST /admin/rotate-index` | Compact the index log, archive a snapshot, apply retention |
 | `POST /admin/reload-access` | Re-read `access.json` without restarting. A file that does not parse or validate is refused with the specific problems, and the previous access data stays in effect |
 | `GET /admin/logs` | Request logs from the past 7 days |
-
-### Identity Endpoints
-
-Both sit behind authentication, so they double as a connectivity check and token renewal.
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /version` | Server version (from package.json). Lightweight heartbeat. |
-| `GET /whoami` | Caller's identity, groups, admin status and rule list |
-| `GET /whoami?keys=a,b` | Same, plus resolved CRUDX permissions for the requested keys |
 
 ## Configuration Reference
 
@@ -886,25 +1022,6 @@ derived from each document's own `_modCounter` during a rebuild, so the values
 `/admin/modifications/:since` reports after a restore do not continue the old
 sequence. Clients polling that endpoint must reset their cursor rather than resume
 from the number they last saw.
-
-## Comparison with Other Databases
-
-> 🟢 Built-in / native &nbsp;&nbsp; 🟡 Partial / separate service &nbsp;&nbsp; 🔴 Not available
-
-| Feature | DeepJSON | Firebase | MongoDB | Redis | Supabase |
-|---------|:--------:|:--------:|:-------:|:-----:|:--------:|
-| JSON document storage | 🟢 Native | 🟢 Native | 🟢 BSON | 🟢 Native | 🟡 JSONB |
-| Server-side scripting | 🟢 WASM | 🟡 Separate | 🟡 Deprecated | 🟡 Lua | 🟡 Separate |
-| Real-time sync | 🟢 WebSocket | 🟢 Built-in | 🟡 Streams | 🟡 Pub/Sub | 🟢 Built-in |
-| Binary file storage | 🟢 Same API | 🟡 Separate | 🟡 GridFS | 🔴 | 🟡 Separate |
-| Image processing | 🟢 Built-in | 🟡 Extension | 🔴 | 🔴 | 🟡 Storage |
-| Self-hosted | 🟢 | 🔴 | 🟢 | 🟢 | 🟢 |
-| Zero-dependency client | 🟢 | 🔴 | 🔴 | 🔴 | 🔴 |
-| HMAC device auth | 🟢 | 🔴 | 🔴 | 🔴 | 🔴 |
-| Sliding token renewal | 🟢 Auto | 🟡 Managed | 🔴 | 🔴 | 🟡 Managed |
-| Permission model | CRUDX | Rules | RBAC | ACL | RLS |
-| Setup complexity | 1 config | Console | Standalone | Config | Multi-svc |
-| Horizontal scaling | Sharded | Managed | Sharding | Cluster | Managed |
 
 ## License
 
