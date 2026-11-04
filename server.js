@@ -1821,6 +1821,16 @@ class DeepJSONServer {
                 req.modifiable_method = true;
             }
 
+            // A dry run runs everything except the write itself, see step 5.
+            const dryRun = ['POST', 'PUT', 'DELETE'].includes(req.method)
+                && /^(true|1)$/i.test(String(req.headers['x-deepjson-dry-run'] || '').trim());
+            if (dryRun) {
+                res.set('X-DeepJSON-Dry-Run', 'true');
+                if (res.locals.fileUpload) {
+                    return res.status(400).json({ error: 'Dry run is not supported for file uploads yet' });
+                }
+            }
+
             // New key names must not hold control characters; existing keys stay reachable.
             if (req.method === 'POST' && !this.index.has(key)) {
                 const problem = this.keyNameProblem(key);
@@ -1988,6 +1998,26 @@ class DeepJSONServer {
             }
 
             // 5. Handle core operations
+            // A dry run reports what the switch below would do and stops before it.
+            // The script sandbox has no I/O, so the script above already ran for real.
+            if (dryRun && !response.options.error) {
+                if (req.method === 'POST' && exists && !res.locals.overwriteExisting) {
+                    return res.status(400).json({ error: 'Key already exists (alternatively try "x-override-existing")' });
+                }
+                const isDelete = req.method === 'DELETE';
+                return res.status(200).json({
+                    dryRun: true,
+                    status: isDelete ? 204 : req.method === 'POST' ? 201 : 200,
+                    exists,
+                    // Only U/D was checked above, so the stored value needs R of its own;
+                    // a write-only user would otherwise read the key through a dry run.
+                    before: this.checkPermissions(user, key, 'R') ? data?.value ?? null : undefined,
+                    after: isDelete ? null : response.data.value ?? null,
+                    response: isDelete ? null : generatedKey
+                        ? { ok: "success", key: generatedKey }
+                        : response.response ?? null
+                });
+            }
             if (!response.options.error) switch (req.method) {
                 case 'GET':
                     res.set({

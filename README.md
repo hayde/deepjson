@@ -307,6 +307,35 @@ Without `abort` a script cannot decline a write. Setting an error on `response`
 alone still returns the document to be stored, so the write happens anyway, the
 document's `_modCounter` advances and the request reports success.
 
+#### Dry run
+
+Send `X-DeepJSON-Dry-Run: true` (or `1`) with a `POST`, `PUT` or `DELETE` to see what the
+write would do without doing it. Authentication, permissions, `If-Match`, the script and
+`abort` all run as usual, so a refusal comes back with its real status. On success nothing
+is written, no index entry or modification counter changes, and the answer is a `200`:
+
+```bash
+curl -X PUT https://your-host/keys/reports.q3 -H "Authorization: Bearer $TOKEN" \
+  -H 'X-DeepJSON-Dry-Run: true' -H 'Content-Type: text/plain' \
+  -d 'javascript: data.revenue += body.add; response = data; javascript! {"add": 100}'
+```
+
+```json
+{
+  "dryRun": true,
+  "status": 200,
+  "exists": true,
+  "before": { "revenue": 50000 },
+  "after": { "revenue": 50100 },
+  "response": { "revenue": 50100 }
+}
+```
+
+`status` is what the real call would return (`201` for a new key, `204` for a delete) and
+`after` is `null` for a delete. `before` is left out when you have no read (R) permission on
+the key, so a write-only user cannot read it through a dry run. File uploads are refused with
+`400` for now.
+
 The script engine is configurable. The default is `wasm` (QuickJS compiled to WebAssembly), chosen for its strong isolation: even a bug in the JS engine itself cannot reach the host Node.js process.
 
 #### Request bodies over plain HTTP
