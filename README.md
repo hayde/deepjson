@@ -77,7 +77,9 @@ The running server reports its own version at `GET /version`. See [CHANGELOG.md]
 
 ### 4. Give your agent its own account
 
-Don't give an agent your admin login. Create a separate account that can only reach the keys it needs. In this example, the agent can create, read, update and run scripts on keys that start with `example.`, but it can't delete them or touch any other key.
+DeepJSON stores everything under named keys, such as `example.jobs`, and permissions are set by key name. So don't give an agent your admin login. Give it its own account that can only reach the keys it needs.
+
+The rule below applies to every key that starts with `example.`. The agent can create, read, update and run scripts on those keys, but it can't delete them or touch any other key.
 
 Add this to `access.json`, then restart the server or call `POST /admin/reload-access` as an admin:
 
