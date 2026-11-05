@@ -276,12 +276,6 @@ Look elsewhere, or pair DeepJSON with something else, when you need:
 - **Queries on document contents across many keys.** There is no value index, and joins and analytics are out of scope. See [Querying](#querying) for what works instead.
 - **Heavy writing to one very large key.** Many workers on one key work fine because writes take turns, but each write handles the whole document, so the turns get slower as it grows. Split large collections into more keys before they get that far.
 
-## What is not there yet
-
-- **No undo.** A successful `PUT` or `DELETE` replaces or removes the value, and no earlier version is kept. Preview risky writes with a dry run and [keep backups](#backup-and-restore).
-- **No short-lived or per-task tokens.** An account's rights apply to all its tokens, and a token keeps renewing while it is used. Give each agent an account with only the rights it needs.
-- **No MCP server.** Agents use the HTTP API or a [connector](#connectors).
-
 ## Comparison with Other Databases
 
 > 🟢 Built-in / native &nbsp;&nbsp; 🟡 Partial / separate service &nbsp;&nbsp; 🔴 Not available
