@@ -211,6 +211,13 @@ A mistake in a script comes back in a form an agent can act on:
 - **A script sees only its own key.** It cannot read other keys, the filesystem or the network.
 - **To run a script without writing,** send it as a `POST` with `x-method-override: GET`.
 - **Keep the newest token.** Each authenticated response carries a renewed one in `X-Renewed-Token`, and a token expires after an hour without renewal. `GET /version` works as a heartbeat.
+- **Change a value with a script, not by reading and writing it back.** In a test, 20 parallel script increments gave 20, while 20 parallel read-then-write cycles gave 1. If a script can't do the job, use `If-Match` with the ETag: a stale version gets `412`.
+- **Return only the answer from big documents.** A script that doesn't mention `data`, `origin` or `custom` doesn't copy them into the sandbox, which is much faster on a very large document.
+- **Existing keys also have `custom`, for metadata.** Scripts read and assign it. A plain `GET` doesn't show it, and a plain `PUT` leaves it alone. To change only metadata: `custom = body; response = { ok: true };`
+- **Scripts have limits.** They time out with `500 SCRIPT_TIMEOUT` (5 seconds unless configured otherwise) and have a 350 MB memory limit. `console`, `require` and `fetch` don't exist.
+- **A move needs delete rights on the source** and create or update rights on the target.
+- **Upload files as `multipart/form-data`.** To add metadata, set `custom` with a script afterwards.
+- **A missing key gives `404`.** That's often normal, like a new user with no saved settings yet, so handle it instead of treating it as a failure.
 
 ## Core principle: compute is cheap, transport is not
 
@@ -267,7 +274,7 @@ Look elsewhere, or pair DeepJSON with something else, when you need:
 
 - **Vector or semantic search.**
 - **Queries on document contents across many keys.** There is no value index, and joins and analytics are out of scope. See [Querying](#querying) for what works instead.
-- **Many writers on one very large key.** Writers to one key take turns, and each write handles the whole document. Split large collections into more keys before they get that far.
+- **Heavy writing to one very large key.** Many workers on one key work fine because writes take turns, but each write handles the whole document, so the turns get slower as it grows. Split large collections into more keys before they get that far.
 
 ## What is not there yet
 
