@@ -77,9 +77,11 @@ The running server reports its own version at `GET /version`. See [CHANGELOG.md]
 
 ### 4. Give your agent its own account
 
-DeepJSON stores everything under named keys, such as `example.jobs`, and permissions are set by key name. So don't give an agent your admin login. Give it its own account that can only reach the keys it needs.
+Think of it like a Docker container: an agent works inside the limits you set and can't reach any key outside them. So don't give it your admin login. Give it its own account.
 
-The rule below applies to every key that starts with `example.`. The agent can create, read, update and run scripts on those keys, but it can't delete them or touch any other key.
+DeepJSON stores everything under named keys, and a dot groups related keys. `blog.welcome` could hold one blog post and `users.alice` one user account. Permissions are set by key name, so you can let an agent run your blog without letting it near your users.
+
+The rule below applies to every key that starts with `blog.`. The agent can create, read, update and run scripts on those keys, but it can't delete them or touch any other key, such as `users.alice`.
 
 Add this to `access.json`, then restart the server or call `POST /admin/reload-access` as an admin:
 
@@ -89,7 +91,7 @@ Add this to `access.json`, then restart the server or call `POST /admin/reload-a
     "agent": { "id": "agent", "password": "scrypt:<salt>:<hash>", "groups": ["agents"] }
   },
   "groups": {
-    "agents": { "rules": [{ "regex": "^example\\.", "crudx": "11101" }] }
+    "agents": { "rules": [{ "regex": "^blog\\.", "crudx": "11101" }] }
   }
 }
 ```
@@ -141,7 +143,7 @@ pip install deepjson-py-connector
 
 ## Try it: a job queue in five requests
 
-No queue service is needed. The script takes the next pending job and marks it in the same write, so two workers can never get the same job.
+No queue service is needed. Here `blog.jobs` holds a list of posts waiting to be written. The script takes the next pending job and marks it in the same write, so two workers can never get the same job.
 
 ```bash
 # 1. Log in
@@ -150,7 +152,7 @@ TOKEN=$(curl -s -X POST http://localhost:3000/auth/login \
   -d '{"username":"agent","password":"your-agent-password"}' | jq -r .token)
 
 # 2. Create the queue
-curl -X POST http://localhost:3000/keys/example.jobs \
+curl -X POST http://localhost:3000/keys/blog.jobs \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '[{"id":1,"status":"pending"},{"id":2,"status":"pending"}]'
 
@@ -162,16 +164,16 @@ else { job.status = "processing"; job.worker = body.worker; response = job; }
 javascript! {"worker":"agent-1"}'
 
 # 3. Preview it: nothing is written
-curl -X PUT http://localhost:3000/keys/example.jobs \
+curl -X PUT http://localhost:3000/keys/blog.jobs \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' \
   -H 'X-DeepJSON-Dry-Run: true' -d "$TAKE_NEXT"
 
 # 4. Run it for real
-curl -X PUT http://localhost:3000/keys/example.jobs \
+curl -X PUT http://localhost:3000/keys/blog.jobs \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' -d "$TAKE_NEXT"
 
 # 5. Read the result
-curl http://localhost:3000/keys/example.jobs -H "Authorization: Bearer $TOKEN"
+curl http://localhost:3000/keys/blog.jobs -H "Authorization: Bearer $TOKEN"
 ```
 
 The preview in step 3 answers:
@@ -547,8 +549,8 @@ example:
 ```
 Permission warning: user "alice" is denied C on 2 keys, U on 2 keys, D on 2 keys,
 X on 2 keys by a group listed after the one that granted it. Example:
-"example.docs.1" - C granted by group "worker" rule "^example\..*", then denied by
-group "readonly" rule "^example\.docs\..*".
+"blog.drafts.1" - C granted by group "worker" rule "^blog\..*", then denied by
+group "readonly" rule "^blog\.drafts\..*".
 ```
 
 The within-group idiom above is not reported, since it is intentional. To learn what
@@ -591,14 +593,14 @@ keyspace lives in memory, so a pattern over key *names* is answered without
 reading a single document:
 
 ```javascript
-// every document in one project
-const { keys, total } = await dj.listKeys('^example\\.website\\.docs\\.');
+// every blog post from 2026
+const { keys, total } = await dj.listKeys('^blog\\.2026\\.');
 
 // just the count, no keys transferred
-const { total } = await dj.listKeys('^example\\.', { count: true });
+const { total } = await dj.listKeys('^blog\\.', { count: true });
 
 // one page at a time
-const page = await dj.listKeys('^example\\.', { limit: 100, offset: 200 });
+const page = await dj.listKeys('^blog\\.', { limit: 100, offset: 200 });
 ```
 
 | Option | Meaning |
