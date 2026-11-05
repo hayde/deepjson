@@ -16,7 +16,7 @@ Most databases only store data. Scripting, files, real-time sync and access cont
 - **Binary file storage**: upload images, PDFs and documents as first-class keys, next to the data they belong to. Images are served with on-the-fly resizing, cropping and format conversion.
 - **Real-time sync**: built-in channels over Socket.IO with master/client sessions. No need for a separate pub/sub service.
 - **Security built in**: authentication, permissions, token renewal and password hashing are part of the server, so there are no auth layers to wire up, no API keys to manage between services and no inter-service communication to secure.
-- **Sliding session tokens**: every response to a logged-in client carries a new 1-hour JWT. A client that keeps the newest token stays signed in as long as it makes a request at least once an hour.
+- **Sliding session tokens**: every response carries a fresh token, so an active client stays signed in without logging in again.
 - **Zero-dependency connector**: the official [JavaScript client](https://github.com/hayde/deepjson-js-connector) runs in Node.js and the browser with no runtime dependencies. In a browser, copy `dist/deepjson-connector.min.js` from the package and load it with one `<script>` tag, no build step and no CDN. A [Python connector](https://pypi.org/project/deepjson-py-connector/) is also available.
 
 ## Quick Start
