@@ -77,9 +77,9 @@ The running server reports its own version at `GET /version`. See [CHANGELOG.md]
 
 ### 4. Give your agent its own account
 
-Think of it like a Docker container: an agent works inside the limits you set and can't reach any key outside them. So don't give it your admin login. Give it its own account.
+An agent works inside the limits you set and can't reach any key outside them (like a Docker container). So don't give it your admin login. Give it its own account.
 
-DeepJSON stores everything under named keys, and a dot groups related keys. `blog.welcome` could hold one blog post and `users.alice` one user account. Permissions are set by key name, so you can let an agent run your blog without letting it near your users.
+DeepJSON stores everything under named keys and a dot groups related keys. `blog.welcome` could hold one blog post and `users.alice` one user account. Permissions are set by key name, so you can let an agent run your blog without letting it near your users.
 
 The rule below applies to every key that starts with `blog.`. The agent can create, read, update and run scripts on those keys, but it can't delete them or touch any other key, such as `users.alice`.
 
@@ -247,11 +247,6 @@ This is why the server looks the way it does:
 | On-the-fly image transformation | The full-resolution original, when a 400px thumbnail was wanted |
 | Real-time channels | Repeated polling for data that has not changed |
 | Wildcard key generation | A round trip to ask which identifier is free |
-
-The practical consequence for anyone building on it: if you find yourself reading
-a document in order to decide something and then writing it back, that logic
-belongs in a script. One round trip, no payload and the operation is serialized
-against other writers for free.
 
 ## When to use DeepJSON
 
