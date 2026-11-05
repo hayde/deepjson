@@ -13,7 +13,7 @@ Most databases only store data. Scripting, files, real-time sync and access cont
 - **Writes an agent can check**: preview any write with a [dry run](#dry-run), get script errors with the line and column and use [`If-Match`](#conditional-requests) so a write based on old data is refused instead of overwriting newer data.
 - **Agents coordinate through it**: writes to the same key happen one at a time, so agents can share work and status with nothing but keys and scripts.
 - **Permissions for each agent**: give every agent or user only the keys it needs, and decide separately whether it may run scripts.
-- **Binary file storage**: upload images, PDFs and documents as first-class keys, next to the data they belong to. Images are served with on-the-fly resizing, cropping and format conversion.
+- **Binary file storage**: upload images, PDFs and documents as first-class keys, next to the data they belong to. Each file can carry its own metadata, so an agent finds what it needs right on the file. Images are served with on-the-fly resizing, cropping and format conversion.
 - **Real-time sync**: built-in channels over Socket.IO with master/client sessions. No need for a separate pub/sub service.
 - **Security built in**: authentication, permissions, token renewal and password hashing are part of the server, so there are no auth layers to wire up, no API keys to manage between services and no inter-service communication to secure.
 - **Sliding session tokens**: every response carries a fresh token, so an active client stays signed in without logging in again.
@@ -189,7 +189,7 @@ The preview in step 3 answers:
 }
 ```
 
-Every operation on the queue handles the whole array, so see [when not to use DeepJSON](#when-not-to-use-deepjson) before growing it much further.
+This pattern runs in production, where about eight workers in two languages coordinate through DeepJSON alone. Every operation on the queue handles the whole array, so see [when not to use DeepJSON](#when-not-to-use-deepjson) before growing it much further.
 
 A mistake in a script comes back in a form an agent can act on:
 
@@ -273,7 +273,7 @@ DeepJSON works well as:
 Look elsewhere, or pair DeepJSON with something else, when you need:
 
 - **Vector or semantic search.**
-- **Queries on document contents across many keys.** There is no value index, and joins and analytics are out of scope. See [Querying](#querying) for what works instead.
+- **Joins, analytics or ad-hoc queries across many separate keys.** You can search by key name and inside a document, as [Querying](#querying) shows, but there is no index on contents across keys.
 - **Heavy writing to one very large key.** Many workers on one key work fine because writes take turns, but each write handles the whole document, so the turns get slower as it grows. Split large collections into more keys before they get that far.
 
 ## Comparison with Other Databases
@@ -580,9 +580,9 @@ Both sit behind authentication, so they double as a connectivity check and token
 
 ### Querying
 
-DeepJSON has no value-based query engine. There are two patterns instead, and
-between them they cover most access patterns without one, but it is worth knowing
-the limit before you design around it.
+You search in two ways: by key name, and inside a document with a script. Between
+them they cover most access patterns without a separate query engine, but it is
+worth knowing the limit before you design around it.
 
 **1. The key hierarchy is the index.** Keys are dotted paths, and the whole
 keyspace lives in memory, so a pattern over key *names* is answered without
@@ -629,6 +629,15 @@ const result = await dj.put('projects', { id: 'website', count: 20 }, `
 Nothing but the request and `{ start, end }` crosses the network. This is the
 [core principle](#core-principle-compute-is-cheap-transport-is-not) applied to
 reads as much as writes.
+
+Searching works the same way, and only the matches come back:
+
+```javascript
+// every unpaid order in the collection
+const unpaid = await dj.get('orders', null, `
+  response = data.filter(order => order.status === 'unpaid');
+`);
+```
 
 **What this does not do.** There is no index on document contents, so "every
 document where `status = 'pending'`" means reading every candidate document. A
@@ -912,9 +921,9 @@ Tests use Node's built-in `node:test` runner. No test framework to install.
 
 ### Horizontal scaling: key-based sharding
 
-This needs no changes to the server, only proxy configuration, which you write yourself: DeepJSON does not ship one.
+When one server is not enough, add another and decide which keys it owns. This needs no changes to the server, only proxy configuration, which you write yourself: DeepJSON does not ship one.
 
-nginx computes the SHA-256 of the key in Lua and routes each request to the instance that owns that key's hash range. Every instance has its own `data_root` and its own index, and is the sole reader and writer for its keys. Nothing is shared, so nothing needs coordinating: per-key write serialization, index consistency and index rotation are each already correct within a shard. Clients talk to one endpoint and need no awareness of the split.
+The key is in the URL, so the proxy can route by name, for example `blog.*` to one server and `orders.*` to another. To spread keys evenly instead, nginx computes the SHA-256 of the key in Lua and routes each request to the instance that owns that key's hash range. Every instance has its own `data_root` and its own index, and is the sole reader and writer for its keys. Nothing is shared, so nothing needs coordinating: per-key write serialization, index consistency and index rotation are each already correct within a shard. Clients talk to one endpoint and need no awareness of the split.
 
 ```
                     ┌──────────────┐
@@ -928,7 +937,7 @@ nginx computes the SHA-256 of the key in Lua and routes each request to the inst
 
 Requirements:
 
-- **Map fixed hash buckets to instances**, not `hash % instance_count`. With buckets, adding an instance relocates one bucket's keys; with modulo, nearly the whole keyspace moves.
+- **If you route by hash, map fixed buckets to instances**, not `hash % instance_count`. With buckets, adding an instance relocates one bucket's keys; with modulo, nearly the whole keyspace moves.
 - **Key listings are per-shard.** `GET /cmd/keys/` and `GET /admin/keys` return the keys of the instance that answered. Fan out client-side if you need a complete listing.
 - **`POST /cmd/move` is shard-local.** Its keys travel in the request body, so the proxy cannot route it by key. Moves whose source and target fall in different shards need a coordinator.
 - **`*{type:inc}` is per-shard.** The next sequence number is taken from the serving instance's index, so two shards can issue the same number. Use `*{type:random}`, or route one key family to a single shard. `*{type:random}` is unaffected.
