@@ -77,7 +77,9 @@ The running server reports its own version at `GET /version`. See [CHANGELOG.md]
 
 ### 4. Give your agent its own account
 
-Do not hand an agent your admin login. This rule gives it create, read, update and execute on `acme.*`, no delete and no access to anything else. Add it to `access.json`, then restart or call `POST /admin/reload-access` as an admin:
+Don't give an agent your admin login. Create a separate account that can only reach the keys it needs. In this example, the agent can create, read, update and run scripts on keys that start with `example.`, but it can't delete them or touch any other key.
+
+Add this to `access.json`, then restart the server or call `POST /admin/reload-access` as an admin:
 
 ```json
 {
@@ -85,7 +87,7 @@ Do not hand an agent your admin login. This rule gives it create, read, update a
     "agent": { "id": "agent", "password": "scrypt:<salt>:<hash>", "groups": ["agents"] }
   },
   "groups": {
-    "agents": { "rules": [{ "regex": "^acme\\.", "crudx": "11101" }] }
+    "agents": { "rules": [{ "regex": "^example\\.", "crudx": "11101" }] }
   }
 }
 ```
@@ -146,7 +148,7 @@ TOKEN=$(curl -s -X POST http://localhost:3000/auth/login \
   -d '{"username":"agent","password":"your-agent-password"}' | jq -r .token)
 
 # 2. Create the queue
-curl -X POST http://localhost:3000/keys/acme.jobs \
+curl -X POST http://localhost:3000/keys/example.jobs \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '[{"id":1,"status":"pending"},{"id":2,"status":"pending"}]'
 
@@ -158,16 +160,16 @@ else { job.status = "processing"; job.worker = body.worker; response = job; }
 javascript! {"worker":"agent-1"}'
 
 # 3. Preview it: nothing is written
-curl -X PUT http://localhost:3000/keys/acme.jobs \
+curl -X PUT http://localhost:3000/keys/example.jobs \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' \
   -H 'X-DeepJSON-Dry-Run: true' -d "$TAKE_NEXT"
 
 # 4. Run it for real
-curl -X PUT http://localhost:3000/keys/acme.jobs \
+curl -X PUT http://localhost:3000/keys/example.jobs \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' -d "$TAKE_NEXT"
 
 # 5. Read the result
-curl http://localhost:3000/keys/acme.jobs -H "Authorization: Bearer $TOKEN"
+curl http://localhost:3000/keys/example.jobs -H "Authorization: Bearer $TOKEN"
 ```
 
 The preview in step 3 answers:
@@ -543,8 +545,8 @@ example:
 ```
 Permission warning: user "alice" is denied C on 2 keys, U on 2 keys, D on 2 keys,
 X on 2 keys by a group listed after the one that granted it. Example:
-"acme.docs.1" - C granted by group "worker" rule "^acme\..*", then denied by
-group "readonly" rule "^acme\.docs\..*".
+"example.docs.1" - C granted by group "worker" rule "^example\..*", then denied by
+group "readonly" rule "^example\.docs\..*".
 ```
 
 The within-group idiom above is not reported, since it is intentional. To learn what
@@ -588,13 +590,13 @@ reading a single document:
 
 ```javascript
 // every document in one project
-const { keys, total } = await dj.listKeys('^acme\\.website\\.docs\\.');
+const { keys, total } = await dj.listKeys('^example\\.website\\.docs\\.');
 
 // just the count, no keys transferred
-const { total } = await dj.listKeys('^acme\\.', { count: true });
+const { total } = await dj.listKeys('^example\\.', { count: true });
 
 // one page at a time
-const page = await dj.listKeys('^acme\\.', { limit: 100, offset: 200 });
+const page = await dj.listKeys('^example\\.', { limit: 100, offset: 200 });
 ```
 
 | Option | Meaning |
