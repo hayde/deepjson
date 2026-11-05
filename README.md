@@ -11,7 +11,7 @@ Most databases only store data. Scripting, files, real-time sync and access cont
 - **Easy for an agent to learn**: JSON over plain HTTP from any language, with no schema, migrations or ORM. The server is small enough to read when the docs leave a question open.
 - **Logic runs where the data is**: send JavaScript alongside your request, executed in a sandboxed WebAssembly environment (QuickJS). No Lambda functions, no separate compute layer. The script runs against your data and returns the result in one round trip.
 - **Writes an agent can check**: preview any write with a [dry run](#dry-run), get script errors with the line and column and use [`If-Match`](#conditional-requests) so a write based on old data is refused instead of overwriting newer data.
-- **Agents coordinate through it**: writes to one key through `/keys/:key` happen one at a time, so agents can share work and status with nothing but keys and scripts.
+- **Agents coordinate through it**: writes to the same key happen one at a time, so agents can share work and status with nothing but keys and scripts.
 - **CRUDX permissions**: regex-based access control, so each agent or user gets only the keys it needs. The X stands for eXecute: script execution is a separate permission, not bundled with read/write. `GET /whoami?keys=a,b` answers what a caller may do before it tries.
 - **Binary file storage**: upload images, PDFs and documents as first-class keys, next to the data they belong to. Images are served with on-the-fly resizing, cropping and format conversion.
 - **Real-time sync**: built-in channels over Socket.IO with master/client sessions. No need for a separate pub/sub service.
