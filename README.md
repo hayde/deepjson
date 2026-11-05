@@ -2,7 +2,7 @@
 
 **The agent database. One server instead of multiple services.**
 
-Data, files, scripts, real-time channels and permissions, all behind one HTTP API. No tables to define and nothing to wire together. Your agent sends the logic and it runs right next to the data.
+Data, files, scripts, real-time channels and permissions, all in one server. No tables to define and nothing to wire together. Your agent sends the logic and it runs right next to the data.
 
 ## Why DeepJSON
 
@@ -10,7 +10,7 @@ Most databases only store data. Scripting, files, real-time sync and access cont
 
 - **Easy for an agent to learn**: JSON over plain HTTP from any language, with no schema, migrations or ORM. The server is small enough to read when the docs leave a question open.
 - **Logic runs where the data is**: send JavaScript alongside your request, executed in a sandboxed WebAssembly environment (QuickJS). No Lambda functions, no separate compute layer. The script runs against your data and returns the result in one round trip.
-- **Writes an agent can check**: preview any write with a [dry run](#dry-run), get script errors with the line and column, and use [`If-Match`](#conditional-requests) so a write based on old data is refused instead of overwriting newer data.
+- **Writes an agent can check**: preview any write with a [dry run](#dry-run), get script errors with the line and column and use [`If-Match`](#conditional-requests) so a write based on old data is refused instead of overwriting newer data.
 - **Agents coordinate through it**: writes to one key through `/keys/:key` happen one at a time, so agents can share work and status with nothing but keys and scripts.
 - **CRUDX permissions**: regex-based access control, so each agent or user gets only the keys it needs. The X stands for eXecute: script execution is a separate permission, not bundled with read/write. `GET /whoami?keys=a,b` answers what a caller may do before it tries.
 - **Binary file storage**: upload images, PDFs and documents as first-class keys, next to the data they belong to. Images are served with on-the-fly resizing, cropping and format conversion.
@@ -183,6 +183,8 @@ The preview in step 3 answers:
 }
 ```
 
+Every operation on the queue handles the whole array, so see [when not to use DeepJSON](#when-not-to-use-deepjson) before growing it much further.
+
 A mistake in a script comes back in a form an agent can act on:
 
 ```json
@@ -193,8 +195,6 @@ A mistake in a script comes back in a form an agent can act on:
   "column": 16
 }
 ```
-
-Every operation on that array handles the whole document, so see [when not to use DeepJSON](#when-not-to-use-deepjson) before growing one much further.
 
 ## What an agent should know
 
@@ -244,7 +244,7 @@ This is why the server looks the way it does:
 
 The practical consequence for anyone building on it: if you find yourself reading
 a document in order to decide something and then writing it back, that logic
-belongs in a script. One round trip, no payload, and the operation is serialized
+belongs in a script. One round trip, no payload and the operation is serialized
 against other writers for free.
 
 ## When to use DeepJSON
@@ -303,6 +303,8 @@ Send JavaScript code with any request. Scripts execute in a sandboxed QuickJS We
 
 Scripts support modern JavaScript (QuickJS, ES2020): `let`, `const`, arrow functions, template literals and so on.
 
+Scripts run in QuickJS compiled to WebAssembly, chosen for its isolation from the host Node.js process. `script_engine` has one value today: `wasm`.
+
 This is the mechanism behind [the core principle](#core-principle-compute-is-cheap-transport-is-not): the script runs where the data already sits, so a read-modify-write costs one round trip and moves no document.
 
 ```javascript
@@ -340,9 +342,8 @@ Scripts receive a context object with:
 
 When a script throws or fails to compile, the request fails with status 500 and the response
 carries the position inside your script (line 1 is the first line you sent), with `code` set to
-`SCRIPT_ERROR`. A script that runs past
-the time limit returns `SCRIPT_TIMEOUT` instead. `line` and `column` are left out when the
-engine reports no position inside your code.
+`SCRIPT_ERROR`. A script that runs past the time limit returns `SCRIPT_TIMEOUT` instead. `line`
+and `column` are left out when the engine reports no position inside your code.
 
 ```json
 {
@@ -377,7 +378,7 @@ document's `_modCounter` advances and the request reports success.
 Send `X-DeepJSON-Dry-Run: true` (or `1`) with a `POST`, `PUT` or `DELETE` to see what the
 write would do without doing it. Authentication, permissions, `If-Match`, the script and
 `abort` all run as usual, so a refusal comes back with its real status. On success nothing
-is written, no index entry or modification counter changes, and the answer is a `200`:
+is written, no index entry or modification counter changes and the answer is a `200`:
 
 ```bash
 curl -X PUT https://your-host/keys/reports.q3 -H "Authorization: Bearer $TOKEN" \
@@ -400,8 +401,6 @@ curl -X PUT https://your-host/keys/reports.q3 -H "Authorization: Bearer $TOKEN" 
 `after` is `null` for a delete. `before` is left out when you have no read (R) permission on
 the key, so a write-only user cannot read it through a dry run. File uploads are refused with
 `400` for now.
-
-Scripts run in QuickJS compiled to WebAssembly, chosen for its isolation from the host Node.js process. `script_engine` has one value today: `wasm`.
 
 #### Request bodies over plain HTTP
 
@@ -431,7 +430,7 @@ data, even a JSON string that begins with `javascript:`, so a client that sends 
 can never trigger a script by accident.
 
 A body that cannot be read is refused rather than stored: malformed JSON gives
-`400`, a body or file over the key's size limit gives `413`, and a write in any
+`400`, a body or file over the key's size limit gives `413` and a write in any
 other content type, or with none, gives `415`. These refusals are JSON, like every
 other error from `/keys/:key`.
 
@@ -458,10 +457,10 @@ ETag: "3"
 ```
 
 This closes a gap that per-key locking cannot. A write through `/keys/:key` is
-serialized against other writes to the same key, so a script-driven read-modify-write inside one request is
-already safe. But a *client* that reads a document, decides something, and writes
-in a second request can be overtaken in between, and without `If-Match` its write
-wins silently, discarding whatever happened in the gap. With it, the second writer
+serialized against other writes to the same key, so a script-driven read-modify-write
+inside one request is already safe. But a *client* that reads a document, decides
+something and writes in a second request can be overtaken in between, and without
+`If-Match` its write wins silently, discarding whatever happened in the gap. With it, the second writer
 gets a 412 and can retry against the current state.
 
 | Header | On a write (POST/PUT/DELETE) | On a read (GET/HEAD) |
@@ -746,8 +745,8 @@ lock so writes do not queue behind each other's flushes.
 Worth knowing what `"async"` actually risks: nothing is lost when only the server
 process restarts, as in a deployment or `systemctl restart`, because written data
 stays in the OS cache and reaches the disk from there. The exposure is a power cut,
-a kernel panic or a hard reset of the VM, and then the last seconds of *confirmed* writes are gone, with nothing in the logs to
-say so.
+a kernel panic or a hard reset of the VM, and then the last seconds of *confirmed*
+writes are gone, with nothing in the logs to say so.
 
 **When to use which:**
 
@@ -942,7 +941,7 @@ Two pieces are required and not yet implemented:
 - **`stateless` mode**, resolving existence from disk. Existence is established by attempting the read rather than by `stat()`, so NFS attribute caching cannot produce a false miss: close-to-open consistency covers `open()`, and the handler was going to read the document anyway.
 - **Optimistic concurrency on `_modCounter`**, the per-document counter that already exists and increments on every write. Without it two instances can read the same document, run their scripts and both write, losing one update: a disk-backed existence check prevents stale 404s but serializes nothing.
 
-Known limits of this topology: key listings stay index-backed and may be stale, `*{type:inc}` needs a counter key or a pinned instance, and index rotation is refused, since it would rewrite the log from one instance's non-authoritative view.
+Known limits of this topology: key listings stay index-backed and may be stale, `*{type:inc}` needs a counter key or a pinned instance and index rotation is refused, since it would rewrite the log from one instance's non-authoritative view.
 
 ### Real-time channels
 
@@ -958,7 +957,7 @@ Real-time sessions are held per instance in memory. Sticky sessions (session aff
 
 ## Backup and restore
 
-Backups run against a live server. No downtime, no quiescing, and no snapshot
+Backups run against a live server. No downtime, no quiescing and no snapshot
 support required from the filesystem.
 
 That works because of how documents are written: each one goes to a temporary file
@@ -1005,7 +1004,7 @@ reconstructs every entry from the documents themselves, which carry their own
 are present on disk but absent from the index, so reads return 404.
 
 To rehearse a restore without touching production, point a second `dj.config` at a
-copy of the data with a different `port` and `data_root`, start it, rebuild, and
+copy of the data with a different `port` and `data_root`, start it, rebuild and
 compare `GET /cmd/keys/`.
 
 ### Two things to know
