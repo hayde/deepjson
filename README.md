@@ -8,11 +8,11 @@ Data, files, scripts, real-time channels and permissions, all in one server. No 
 
 Most databases only store data. Scripting, files, real-time sync and access control have to come from somewhere else, and every extra service is one more thing for an agent or a developer to learn, connect and secure. DeepJSON handles all of it in a single process with two config files.
 
-- **Easy for an agent to learn**: JSON over plain HTTP from any language, with no schema, migrations or ORM. The server is small enough to read when the docs leave a question open.
+- **Easy for an agent to learn**: JSON over plain HTTP from any language, with no schema, migrations or ORM. The server code is very compact and easy to understand.
 - **Logic runs where the data is**: send JavaScript alongside your request, executed in a sandboxed WebAssembly environment (QuickJS). No Lambda functions, no separate compute layer. The script runs against your data and returns the result in one round trip.
 - **Writes an agent can check**: preview any write with a [dry run](#dry-run), get script errors with the line and column and use [`If-Match`](#conditional-requests) so a write based on old data is refused instead of overwriting newer data.
 - **Agents coordinate through it**: writes to the same key happen one at a time, so agents can share work and status with nothing but keys and scripts.
-- **CRUDX permissions**: regex-based access control, so each agent or user gets only the keys it needs. The X stands for eXecute: script execution is a separate permission, not bundled with read/write. `GET /whoami?keys=a,b` answers what a caller may do before it tries.
+- **Permissions for each agent**: give every agent or user only the keys it needs, and decide separately whether it may run scripts.
 - **Binary file storage**: upload images, PDFs and documents as first-class keys, next to the data they belong to. Images are served with on-the-fly resizing, cropping and format conversion.
 - **Real-time sync**: built-in channels over Socket.IO with master/client sessions. No need for a separate pub/sub service.
 - **Security built in**: authentication, permissions, token renewal and password hashing are part of the server, so there are no auth layers to wire up, no API keys to manage between services and no inter-service communication to secure.
@@ -507,6 +507,8 @@ Permissions are defined per group with regex patterns matching key names. Each r
 | 3 | **D**elete | DELETE keys |
 | 4 | e**X**ecute | Run server-side scripts |
 
+The X is a separate permission: running a script is not bundled with read or write.
+
 Example `access.json`:
 
 ```json
@@ -545,8 +547,8 @@ X on 2 keys by a group listed after the one that granted it. Example:
 group "readonly" rule "^acme\.docs\..*".
 ```
 
-The within-group idiom above is not reported, since it is intentional. For an
-authoritative answer on any key, use `GET /whoami?keys=a,b`. It resolves
+The within-group idiom above is not reported, since it is intentional. To learn what
+a caller may do with a key before it tries, use `GET /whoami?keys=a,b`. It resolves
 permissions through the same code that enforces them, which is why the rule list it
 returns is marked `rulesAreAdvisory`.
 
