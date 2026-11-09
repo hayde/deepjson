@@ -39,6 +39,10 @@ const KEY_CONTROL_CHARS = /[\x00-\x1F\x7F]/;
 // A lone UTF-16 surrogate cannot be written as UTF-8, so it would not survive a restart.
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
+// x-override-existing values that mean "do not overwrite". Any other non-empty value
+// still means yes, as it always has.
+const OVERRIDE_EXISTING_NO = new Set(['false', '0', 'no', 'off']);
+
 // Content types accepted for /keys/:key bodies; any other type on a write gets 415.
 const JSON_BODY_TYPES = ['application/json', 'application/*+json'];
 const KEY_BODY_TYPES = ['text/*', ...JSON_BODY_TYPES, 'multipart/form-data'];
@@ -2966,13 +2970,18 @@ class DeepJSONServer {
         }
     }
 
+    /**
+     * Whether the client asked to overwrite a key that already exists.
+     *
+     * Only the header's presence used to count, so `x-override-existing: false` -
+     * which the JS connector sends on every upload without `overwrite` - replaced
+     * the existing key. An explicit false/0/no/off now means no. Every other
+     * non-empty value still means yes, so clients sending "true", "1" or anything
+     * else keep working.
+     */
     _hasOverwriteExisting(req) {
-        var returnvalue = null;
-        if (req.headers['x-override-existing']) {
-            return true;
-        } else {
-            return false;
-        }
+        const value = String(req.headers['x-override-existing'] ?? '').trim().toLowerCase();
+        return value !== '' && !OVERRIDE_EXISTING_NO.has(value);
     }
 
     processFileUpload(req) {

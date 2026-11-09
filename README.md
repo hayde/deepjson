@@ -204,7 +204,7 @@ A mistake in a script comes back in a form an agent can act on:
 
 ## What an agent should know
 
-- **`POST` creates and `PUT` updates.** `POST` on an existing key gives `400` unless you send `x-override-existing`. `PUT` on a missing key gives `404`.
+- **`POST` creates and `PUT` updates.** `POST` on an existing key gives `400` unless you send `x-override-existing: true` (`false`, `0`, `no` and `off` mean no). `PUT` on a missing key gives `404`.
 - **A script is sent as `text/plain`:** `javascript: <code> javascript! <json>`. The JSON arrives as `body`, and scripts support modern JavaScript.
 - **A write stores whatever `data` holds when the script ends.** A script that creates a key must assign `data`, or the request fails with `400`.
 - **`response` is what comes back.** Set it to return only the answer. Set `abort` to refuse the operation.

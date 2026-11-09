@@ -18,6 +18,20 @@ change affects what a client sees on the wire, it says so.
   status. `before` is only included for callers with read permission on the key. File
   uploads are not supported yet and give `400`.
 
+### Fixed
+
+- **`X-Override-Existing: false` no longer overwrites (#36).** The server only checked
+  whether the header was present, so `false` counted as yes. The JS connector sends
+  `false` on every `uploadFile()` without `overwrite`, so those uploads silently
+  replaced an existing key instead of being refused. The values `false`, `0`, `no`
+  and `off` (any case) now mean no; every other non-empty value still means yes.
+  Applies to `POST /keys/:key`, file uploads, dry runs and moving a key.
+
+  **Upgrade note:** a `POST` or upload to an existing key that sends `false` now gets
+  `400` with `Key already exists`, as it was always meant to. Clients that relied on
+  such uploads succeeding have to handle that `400`, or send `true` if they really
+  want to overwrite.
+
 ### Changed
 
 - **Script errors now report where they happened.** A failing script returns the
