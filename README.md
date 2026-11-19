@@ -8,7 +8,7 @@ Data, files, scripts, real-time channels and permissions, all in one server. No 
 
 Most databases only store data. Scripting, files, real-time sync and access control have to come from somewhere else, and every extra service is one more thing for an agent or a developer to learn, connect and secure. DeepJSON handles all of it in a single process with two config files.
 
-- **Easy for an agent to learn**: JSON over plain HTTP from any language, with no schema, migrations or ORM. The server code is very compact and easy to understand.
+- **Easy for an agent to learn**: JSON over plain HTTP from any language, with no schema, migrations or ORM. The server code is compact and easy to read.
 - **Logic runs where the data is**: send JavaScript alongside your request, executed in a sandboxed WebAssembly environment (QuickJS). No Lambda functions, no separate compute layer. The script runs against your data and returns the result in one round trip.
 - **Writes an agent can check**: preview any write with a [dry run](#dry-run), get script errors with the line and column and use [`If-Match`](#conditional-requests) so a write based on old data is refused instead of overwriting newer data.
 - **Agents coordinate through it**: writes to the same key happen one at a time, so agents can share work and status with nothing but keys and scripts.
